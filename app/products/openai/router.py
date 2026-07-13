@@ -122,13 +122,11 @@ async def _safe_sse(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
     except AppError as exc:
         payload = orjson.dumps({"error": exc.to_dict()["error"]}).decode()
         yield f"event: error\ndata: {payload}\n\n"
-        yield "data: [DONE]\n\n"
     except Exception as exc:
         payload = orjson.dumps(
             {"error": {"message": str(exc), "type": "server_error"}}
         ).decode()
         yield f"event: error\ndata: {payload}\n\n"
-        yield "data: [DONE]\n\n"
 
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}

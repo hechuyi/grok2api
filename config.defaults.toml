@@ -108,6 +108,8 @@ refresh_interval = 3600
 reset_session_status_codes = [403]
 # [App 层] 换账号重试最大次数（0 = 不重试）
 max_retries = 1
+# random 选号策略的换账号重试最大次数
+random_max_retries = 5
 # [App 层] 触发换账号重试的 HTTP 状态码，英文逗号分隔
 on_codes = "429,401,503"
 
@@ -132,6 +134,8 @@ vacuum = false   # 默认禁用，避免大库 VACUUM 锁全库（5-30s）；需
 [account.selection]
 # 单号并发上限（两模式共用）
 max_inflight = 8
+# random 策略最近选中过的账号排除数量；候选不足时自动回退
+recent_exclusion_count = 0
 
 
 # ==================== 对话配置 ====================

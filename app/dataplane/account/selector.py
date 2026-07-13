@@ -14,6 +14,7 @@ Strategy selection is process-global, registered once by the lifespan via
 """
 
 import array  # noqa: F401  — used in forward-referenced type annotations
+from collections import deque
 import random
 from typing import Literal
 
@@ -28,7 +29,7 @@ _W_INFLIGHT = 20.0
 _W_FAIL     = 4.0
 _RECENT_WINDOW_S = 60  # seconds — 覆盖 grok-4-3 思考时长（典型 30-60s），强制账号轮换
 _QUOTA_MAX_INFLIGHT = 12  # quota 策略下单账号最多 12 个并发请求，防止单账号堆积引发上游风控
-_RANDOM_MAX_FAILS = 5  # random 策略下，累计失败 >= 5 次的账号暂时不选（D2 修复）
+_RECENT_SELECTED_IDXS: deque[int] = deque()
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,11 @@ def current_strategy() -> _StrategyName:
     return _STRATEGY_NAME
 
 
+def clear_recent_selections() -> None:
+    """Clear process-local recent-selection memory."""
+    _RECENT_SELECTED_IDXS.clear()
+
+
 # ---------------------------------------------------------------------------
 # Public entry points — delegate to the active strategy
 # ---------------------------------------------------------------------------
@@ -75,7 +81,7 @@ def select(
     """
     if _STRATEGY_NAME == "random":
         return _random_select(
-            table, pool_id,
+            table, pool_id, mode_id,
             exclude_idxs=exclude_idxs,
             prefer_tag_idxs=prefer_tag_idxs,
             now_s=now_s,
@@ -299,29 +305,32 @@ def _best_no_quota(
 def _random_select(
     table: AccountRuntimeTable,
     pool_id: int,
+    mode_id: int | None = None,
     *,
     exclude_idxs: frozenset[int] | None,
     prefer_tag_idxs: set[int] | None,
     now_s: int,
 ) -> int | None:
-    candidates: set[int] = _pool_union(table, pool_id)
+    candidates: set[int] = (
+        table.mode_available.get((pool_id, mode_id), set()).copy()
+        if mode_id is not None
+        else _pool_union(table, pool_id)
+    )
     if not candidates:
         return None
 
-    max_inflight = int(get_config("account.selection.max_inflight", 8))
+    cfg = get_config()
+    max_inflight = int(cfg.get_int("account.selection.max_inflight", 8))
     cooling_col  = table.cooling_until_s_by_idx
     inflight_col = table.inflight_by_idx
-    fail_col     = table.fail_count_by_idx
 
     working = candidates.copy()
     if exclude_idxs:
         working -= exclude_idxs
-    # D2 修复：累计失败 >= _RANDOM_MAX_FAILS 的账号暂时排除，避免重复打到刚失败的账号
     working = {
         idx for idx in working
         if int(cooling_col[idx]) <= now_s
         and int(inflight_col[idx]) < max_inflight
-        and int(fail_col[idx]) < _RANDOM_MAX_FAILS
     }
     if not working:
         return None
@@ -330,7 +339,23 @@ def _random_select(
         preferred = working & prefer_tag_idxs
         working = preferred if preferred else working
 
-    return random.choice(tuple(working))
+    recent_limit = max(
+        0,
+        int(cfg.get_int("account.selection.recent_exclusion_count", 0)),
+    )
+    if recent_limit == 0:
+        _RECENT_SELECTED_IDXS.clear()
+    elif _RECENT_SELECTED_IDXS:
+        filtered = working - set(list(_RECENT_SELECTED_IDXS)[-recent_limit:])
+        if filtered:
+            working = filtered
+
+    selected = random.choice(tuple(working))
+    if recent_limit > 0:
+        _RECENT_SELECTED_IDXS.append(selected)
+        while len(_RECENT_SELECTED_IDXS) > recent_limit:
+            _RECENT_SELECTED_IDXS.popleft()
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -347,4 +372,10 @@ def _pool_union(table: AccountRuntimeTable, pool_id: int) -> set[int]:
     return out
 
 
-__all__ = ["select", "select_any", "set_strategy", "current_strategy"]
+__all__ = [
+    "select",
+    "select_any",
+    "set_strategy",
+    "current_strategy",
+    "clear_recent_selections",
+]

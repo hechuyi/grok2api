@@ -238,8 +238,9 @@ class ProxyDirectory:
                 return None
             if self._egress_mode == EgressMode.SINGLE_PROXY:
                 return nodes[0].proxy_url
-            # PROXY_POOL: sticky routing — use current cursor, rotate on failure.
+            # PROXY_POOL: distribute sequential requests across all egresses.
             idx = self._pool_cursor % len(nodes)
+            self._pool_cursor += 1
             return nodes[idx].proxy_url
 
     async def _get_or_build_bundle(
