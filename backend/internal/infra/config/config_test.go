@@ -84,13 +84,13 @@ func TestLoadAcceptsRuntimeDefaultsAndRejectsUnknownFields(t *testing.T) {
   jwtSecret: "12345678901234567890123456789012"
   credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 routing:
-  maxAttempts: 9
+  maxAttempts: 20
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
-	if err != nil || cfg.Routing.MaxAttempts != 9 {
+	if err != nil || cfg.Routing.MaxAttempts != 20 {
 		t.Fatalf("runtime defaults = %#v, err = %v", cfg.Routing, err)
 	}
 	data = append(data, []byte("unknownField: true\n")...)
@@ -138,13 +138,14 @@ func TestDurationStringUsesCompactYAMLForm(t *testing.T) {
 
 func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 	tests := map[string]func(*Config){
-		"request body": func(cfg *Config) { cfg.Server.MaxBodyBytes = maxServerBodyBytes + 1 },
-		"audit buffer": func(cfg *Config) { cfg.Audit.BufferSize = maxAuditBufferSize + 1 },
-		"client rpm":   func(cfg *Config) { cfg.ClientKeyDefaults.RPMLimit = clientkeydomain.MaxRPMLimit + 1 },
-		"image size":   func(cfg *Config) { cfg.Media.MaxImageBytes = 33 << 20 },
-		"media total":  func(cfg *Config) { cfg.Media.MaxTotalBytes = 1 },
-		"batch limit":  func(cfg *Config) { cfg.Batch.SyncConcurrency = 51 },
-		"batch jitter": func(cfg *Config) { cfg.Batch.RandomDelay = Duration(6 * time.Second) },
+		"request body":     func(cfg *Config) { cfg.Server.MaxBodyBytes = maxServerBodyBytes + 1 },
+		"audit buffer":     func(cfg *Config) { cfg.Audit.BufferSize = maxAuditBufferSize + 1 },
+		"client rpm":       func(cfg *Config) { cfg.ClientKeyDefaults.RPMLimit = clientkeydomain.MaxRPMLimit + 1 },
+		"image size":       func(cfg *Config) { cfg.Media.MaxImageBytes = 33 << 20 },
+		"media total":      func(cfg *Config) { cfg.Media.MaxTotalBytes = 1 },
+		"batch limit":      func(cfg *Config) { cfg.Batch.SyncConcurrency = 51 },
+		"batch jitter":     func(cfg *Config) { cfg.Batch.RandomDelay = Duration(6 * time.Second) },
+		"routing attempts": func(cfg *Config) { cfg.Routing.MaxAttempts = 21 },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

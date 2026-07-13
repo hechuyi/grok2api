@@ -33,6 +33,13 @@ const (
 	MaxConcurrent           = 256
 )
 
+const (
+	ConsoleQuotaMode              = "console"
+	ConsoleQuotaLimit             = 20
+	ConsoleQuotaWindow            = time.Hour
+	ConsoleQuotaRateLimitCooldown = 4 * time.Hour
+)
+
 // AuthStatus 表示账号凭据的认证状态。
 type AuthStatus string
 

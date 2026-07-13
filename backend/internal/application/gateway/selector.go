@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
@@ -26,17 +27,34 @@ type accountLease struct {
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
 const candidateCacheTTL = time.Second
+const candidateSelectionWindow = 64
 
 type candidateSnapshot struct {
-	values    []account.RoutingCandidate
-	expiresAt time.Time
+	values         []account.RoutingCandidate
+	groups         []candidateGroup
+	byID           map[uint64]int
+	quotaOverrides *sync.Map
+	expiresAt      time.Time
 }
+
+type candidateGroup struct{ start, end int }
 
 type candidateCacheKey struct {
 	provider      account.Provider
 	upstreamModel string
 	quotaMode     string
 }
+
+type selectionCursorKey struct {
+	cache candidateCacheKey
+	group int
+	kind  uint8
+}
+
+const (
+	selectionNormal uint8 = iota
+	selectionProbe
+)
 
 func (l *accountLease) Release() {
 	if l != nil && l.release != nil {
@@ -47,18 +65,20 @@ func (l *accountLease) Release() {
 
 // Selector 实现可替换的 balanced 账号选择策略。
 type Selector struct {
-	accounts       repository.AccountRepository
-	concurrency    repository.ConcurrencyLimiter
-	sticky         repository.StickySessionRepository
-	stickyTTL      time.Duration
-	cooldownBase   time.Duration
-	cooldownMax    time.Duration
-	mu             sync.Mutex
-	lastSelectedAt map[uint64]time.Time
-	lastSuccessAt  map[uint64]time.Time
-	candidates     map[candidateCacheKey]candidateSnapshot
-	candidateLoads singleflight.Group
-	tierOrders     interface {
+	accounts         repository.AccountRepository
+	concurrency      repository.ConcurrencyLimiter
+	sticky           repository.StickySessionRepository
+	stickyTTL        time.Duration
+	cooldownBase     time.Duration
+	cooldownMax      time.Duration
+	mu               sync.Mutex
+	lastSelectedAt   map[uint64]time.Time
+	lastSuccessAt    map[uint64]time.Time
+	tieBreakSeed     uint64
+	candidates       map[candidateCacheKey]candidateSnapshot
+	selectionCursors map[selectionCursorKey]uint64
+	candidateLoads   singleflight.Group
+	tierOrders       interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
 }
@@ -66,7 +86,7 @@ type Selector struct {
 func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierOrders interface {
 	TierOrder(account.Provider, string) []account.WebTier
 }, stickyTTL, cooldownBase, cooldownMax time.Duration) *Selector {
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), tieBreakSeed: rand.Uint64(), candidates: make(map[candidateCacheKey]candidateSnapshot), selectionCursors: make(map[selectionCursorKey]uint64)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration) {
@@ -86,64 +106,19 @@ func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration)
 func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, promptCacheKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
 	now := time.Now().UTC()
 	stickyKey := promptCacheStickyKey(promptCacheKey)
-	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
+	cacheKey := candidateCacheKey{provider: provider, upstreamModel: upstreamModel, quotaMode: quotaMode}
+	snapshot, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
 	}
-	normalCandidates := make([]account.RoutingCandidate, 0, len(values))
-	probeCandidates := make([]account.RoutingCandidate, 0, len(values))
-	for _, candidate := range values {
-		value := candidate.Credential
-		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
-			continue
+	probeSeen := false
+	if allowQuotaProbe {
+		lease, seen, selectErr := s.selectCandidate(ctx, cacheKey, snapshot, now, excluded, selectionProbe)
+		if selectErr != nil {
+			return nil, selectErr
 		}
-		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
-			continue
-		}
-		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
-			continue
-		}
-		quotaRecovery := candidate.QuotaRecovery
-		if quotaRecovery != nil && quotaRecovery.Status != account.QuotaRecoveryStatusActive {
-			if allowQuotaProbe && quotaRecovery.NextProbeAt != nil && !now.Before(*quotaRecovery.NextProbeAt) {
-				probeCandidates = append(probeCandidates, candidate)
-			}
-			continue
-		}
-		if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
-			continue
-		}
-		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
-			continue
-		}
-		normalCandidates = append(normalCandidates, candidate)
-	}
-	if len(normalCandidates) == 0 && len(probeCandidates) == 0 {
-		return nil, fmt.Errorf("没有可用上游账号")
-	}
-	if len(probeCandidates) > 0 {
-		if err := s.sortCandidates(ctx, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel)); err != nil {
-			return nil, err
-		}
-		for _, candidate := range probeCandidates {
-			lease, err := s.tryAcquire(ctx, candidate.Credential)
-			if err != nil {
-				return nil, err
-			}
-			if lease == nil {
-				continue
-			}
-			claimed, err := s.accounts.ClaimQuotaProbe(ctx, candidate.Credential.ID, now, now.Add(quotaProbeLease))
-			if err != nil || !claimed {
-				lease.Release()
-				if err != nil {
-					return nil, err
-				}
-				continue
-			}
-			lease.QuotaProbe = true
-			lease.QuotaProbeKind = candidate.QuotaRecovery.Kind
-			lease.Billing = candidate.Billing
+		probeSeen = seen
+		if lease != nil {
 			return lease, nil
 		}
 	}
@@ -153,8 +128,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			return nil, fmt.Errorf("读取会话粘滞状态: %w", err)
 		}
 		if ok {
-			for _, candidate := range normalCandidates {
-				if candidate.Credential.ID == stickyID {
+			if index, exists := snapshot.byID[stickyID]; exists {
+				candidate := snapshotCandidate(snapshot, index)
+				if normalCandidateEligible(candidate, now, excluded) {
 					lease, acquireErr := s.tryAcquire(ctx, candidate.Credential)
 					if acquireErr != nil {
 						return nil, acquireErr
@@ -168,27 +144,22 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			}
 		}
 	}
-	if err := s.sortCandidates(ctx, normalCandidates, now, s.resolveTierOrder(provider, upstreamModel)); err != nil {
+	lease, normalSeen, err := s.selectCandidate(ctx, cacheKey, snapshot, now, excluded, selectionNormal)
+	if err != nil {
 		return nil, err
 	}
-	for _, candidate := range normalCandidates {
-		lease, err := s.tryAcquire(ctx, candidate.Credential)
-		if err != nil {
-			return nil, err
-		}
-		if lease == nil {
-			continue
-		}
+	if lease != nil {
 		if stickyKey != "" {
 			stickyTTL, _, _ := s.routingConfig()
-			if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, now.Add(stickyTTL)); err != nil {
+			if err := s.sticky.Set(ctx, stickyKey, lease.Credential.ID, now.Add(stickyTTL)); err != nil {
 				lease.Release()
 				return nil, fmt.Errorf("写入会话粘滞状态: %w", err)
 			}
 		}
-		lease.Billing = candidate.Billing
-		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
 		return lease, nil
+	}
+	if !probeSeen && !normalSeen {
+		return nil, fmt.Errorf("没有可用上游账号")
 	}
 	return nil, fmt.Errorf("所有上游账号均达到并发上限")
 }
@@ -205,68 +176,264 @@ func promptCacheStickyKey(value string) string {
 // AcquirePinned 为 previous_response_id 等账号归属请求获取指定账号租约。
 func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider, accountID uint64, upstreamModel, quotaMode string, inference bool) (*accountLease, error) {
 	now := time.Now().UTC()
-	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
+	snapshot, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
 	}
-	for _, candidate := range values {
-		value := candidate.Credential
-		if value.ID != accountID {
-			continue
+	index, exists := snapshot.byID[accountID]
+	if !exists {
+		return nil, fmt.Errorf("绑定的上游账号不存在")
+	}
+	candidate := snapshotCandidate(snapshot, index)
+	value := candidate.Credential
+	if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
+		return nil, fmt.Errorf("绑定的上游账号不可用")
+	}
+	if inference {
+		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+			return nil, fmt.Errorf("绑定的上游账号不支持该模型")
 		}
-		if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
-			return nil, fmt.Errorf("绑定的上游账号不可用")
+		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+			return nil, fmt.Errorf("绑定的上游账号正在冷却")
 		}
-		if inference {
-			if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
-				return nil, fmt.Errorf("绑定的上游账号不支持该模型")
+		if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
+			if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
+				return nil, fmt.Errorf("绑定的上游账号额度等待重置")
 			}
-			if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
-				return nil, fmt.Errorf("绑定的上游账号正在冷却")
+			lease, err := s.tryAcquire(ctx, value)
+			if err != nil {
+				return nil, err
 			}
-			if recovery := candidate.QuotaRecovery; recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive {
-				if recovery.NextProbeAt == nil || now.Before(*recovery.NextProbeAt) {
-					return nil, fmt.Errorf("绑定的上游账号额度等待重置")
-				}
-				lease, err := s.tryAcquire(ctx, value)
+			if lease == nil {
+				return nil, fmt.Errorf("绑定的上游账号达到并发上限")
+			}
+			claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
+			if err != nil || !claimed {
+				lease.Release()
 				if err != nil {
 					return nil, err
 				}
-				if lease == nil {
-					return nil, fmt.Errorf("绑定的上游账号达到并发上限")
-				}
-				claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
-				if err != nil || !claimed {
-					lease.Release()
-					if err != nil {
-						return nil, err
-					}
-					return nil, fmt.Errorf("绑定的上游账号恢复探测已被占用")
-				}
-				lease.QuotaProbe = true
-				lease.QuotaProbeKind = recovery.Kind
-				lease.Billing = candidate.Billing
-				return lease, nil
+				return nil, fmt.Errorf("绑定的上游账号恢复探测已被占用")
 			}
-			if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
-				return nil, fmt.Errorf("绑定的上游账号额度不足")
-			}
-			if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
-				return nil, fmt.Errorf("绑定的上游账号该模式额度等待重置")
-			}
-		}
-		lease, err := s.tryAcquire(ctx, value)
-		if err != nil {
-			return nil, err
-		}
-		if lease != nil {
+			lease.QuotaProbe = true
+			lease.QuotaProbeKind = recovery.Kind
 			lease.Billing = candidate.Billing
-			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
 			return lease, nil
 		}
+		if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
+			return nil, fmt.Errorf("绑定的上游账号额度不足")
+		}
+		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
+			return nil, fmt.Errorf("绑定的上游账号该模式额度等待重置")
+		}
+	}
+	lease, err := s.tryAcquire(ctx, value)
+	if err != nil {
+		return nil, err
+	}
+	if lease == nil {
 		return nil, fmt.Errorf("绑定的上游账号达到并发上限")
 	}
-	return nil, fmt.Errorf("绑定的上游账号不存在")
+	lease.Billing = candidate.Billing
+	lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+	return lease, nil
+}
+
+// selectCandidate scans immutable static-priority groups and reads dynamic
+// concurrency only for bounded rotating windows. A full window never prevents
+// later windows or lower static-priority groups from being considered.
+func (s *Selector) selectCandidate(ctx context.Context, cacheKey candidateCacheKey, snapshot candidateSnapshot, now time.Time, excluded map[uint64]bool, kind uint8) (*accountLease, bool, error) {
+	seen := false
+	for groupIndex, group := range snapshot.groups {
+		length := group.end - group.start
+		if length <= 0 {
+			continue
+		}
+		start := s.nextGroupOffset(cacheKey, groupIndex, kind, length)
+		window := make([]account.RoutingCandidate, 0, min(candidateSelectionWindow, length))
+		for scanned := 0; scanned < length; scanned++ {
+			index := group.start + (start+scanned)%length
+			candidate := snapshotCandidate(snapshot, index)
+			eligible := normalCandidateEligible(candidate, now, excluded)
+			if kind == selectionProbe {
+				eligible = probeCandidateEligible(candidate, now, excluded)
+			}
+			if eligible {
+				seen = true
+				window = append(window, candidate)
+			}
+			if len(window) < candidateSelectionWindow && scanned+1 < length {
+				continue
+			}
+			if len(window) == 0 {
+				continue
+			}
+			ordered, err := s.rankCandidateWindow(ctx, window, now)
+			if err != nil {
+				return nil, seen, err
+			}
+			for _, ranked := range ordered {
+				if ranked.full {
+					continue
+				}
+				candidate := ranked.candidate
+				lease, err := s.tryAcquire(ctx, candidate.Credential)
+				if err != nil {
+					return nil, seen, err
+				}
+				if lease == nil {
+					continue
+				}
+				if kind == selectionProbe {
+					claimed, claimErr := s.accounts.ClaimQuotaProbe(ctx, candidate.Credential.ID, now, now.Add(quotaProbeLease))
+					if claimErr != nil || !claimed {
+						lease.Release()
+						if claimErr != nil {
+							return nil, seen, claimErr
+						}
+						continue
+					}
+					lease.QuotaProbe = true
+					lease.QuotaProbeKind = candidate.QuotaRecovery.Kind
+				}
+				lease.Billing = candidate.Billing
+				lease.QuotaMode = effectiveQuotaMode(candidate, cacheKey.quotaMode)
+				return lease, seen, nil
+			}
+			window = window[:0]
+		}
+	}
+	return nil, seen, nil
+}
+
+type rankedCandidate struct {
+	candidate account.RoutingCandidate
+	inFlight  int
+	full      bool
+}
+
+func (s *Selector) rankCandidateWindow(ctx context.Context, values []account.RoutingCandidate, now time.Time) ([]rankedCandidate, error) {
+	keys := make([]string, len(values))
+	for index, candidate := range values {
+		keys[index] = fmt.Sprintf("account:%d", candidate.Credential.ID)
+	}
+	counts := make(map[string]int, len(keys))
+	batchReader, batched := s.concurrency.(repository.ConcurrencySnapshotReader)
+	if batched {
+		var err error
+		counts, err = batchReader.CurrentMany(ctx, keys)
+		if err != nil {
+			return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+		}
+	}
+	ranked := make([]rankedCandidate, len(values))
+	for index, candidate := range values {
+		key := keys[index]
+		current := counts[key]
+		if !batched {
+			var err error
+			current, err = s.concurrency.Current(ctx, key)
+			if err != nil {
+				return nil, fmt.Errorf("读取账号并发租约: %w", err)
+			}
+		}
+		limit := candidate.Credential.MaxConcurrent
+		if limit <= 0 {
+			limit = account.DefaultMaxConcurrent
+		}
+		ranked[index] = rankedCandidate{candidate: candidate, inFlight: current, full: current >= limit}
+	}
+	s.mu.Lock()
+	lastSelected := make(map[uint64]time.Time, len(values))
+	for _, candidate := range values {
+		lastSelected[candidate.Credential.ID] = s.lastSelectedAt[candidate.Credential.ID]
+	}
+	s.mu.Unlock()
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left, right := ranked[i], ranked[j]
+		if left.full != right.full {
+			return !left.full
+		}
+		leftFresh, rightFresh := billingFresh(left.candidate, now), billingFresh(right.candidate, now)
+		if leftFresh != rightFresh {
+			return leftFresh
+		}
+		if left.inFlight != right.inFlight {
+			return left.inFlight < right.inFlight
+		}
+		leftRemaining, rightRemaining := billingRemaining(left.candidate), billingRemaining(right.candidate)
+		if leftRemaining != rightRemaining {
+			return leftRemaining > rightRemaining
+		}
+		leftID, rightID := left.candidate.Credential.ID, right.candidate.Credential.ID
+		if !lastSelected[leftID].Equal(lastSelected[rightID]) {
+			return lastSelected[leftID].Before(lastSelected[rightID])
+		}
+		leftRank, rightRank := accountTieBreakRank(leftID, s.tieBreakSeed), accountTieBreakRank(rightID, s.tieBreakSeed)
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return leftID < rightID
+	})
+	return ranked, nil
+}
+
+func billingFresh(candidate account.RoutingCandidate, now time.Time) bool {
+	return candidate.Billing != nil && now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
+}
+
+func billingRemaining(candidate account.RoutingCandidate) float64 {
+	if candidate.Billing == nil {
+		return 0
+	}
+	return candidate.Billing.Remaining()
+}
+
+func normalCandidateEligible(candidate account.RoutingCandidate, now time.Time, excluded map[uint64]bool) bool {
+	value := candidate.Credential
+	if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
+		return false
+	}
+	if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+		return false
+	}
+	if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+		return false
+	}
+	if candidate.QuotaRecovery != nil && candidate.QuotaRecovery.Status != account.QuotaRecoveryStatusActive {
+		return false
+	}
+	if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
+		return false
+	}
+	return candidate.QuotaWindow == nil || candidate.QuotaWindow.Remaining > 0
+}
+
+func probeCandidateEligible(candidate account.RoutingCandidate, now time.Time, excluded map[uint64]bool) bool {
+	value := candidate.Credential
+	if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
+		return false
+	}
+	if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+		return false
+	}
+	if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+		return false
+	}
+	recovery := candidate.QuotaRecovery
+	return recovery != nil && recovery.Status != account.QuotaRecoveryStatusActive && recovery.NextProbeAt != nil && !now.Before(*recovery.NextProbeAt)
+}
+
+func (s *Selector) nextGroupOffset(cache candidateCacheKey, group int, kind uint8, length int) int {
+	key := selectionCursorKey{cache: cache, group: group, kind: kind}
+	s.mu.Lock()
+	if s.selectionCursors == nil {
+		s.selectionCursors = make(map[selectionCursorKey]uint64)
+	}
+	value := s.selectionCursors[key]
+	s.selectionCursors[key] = value + candidateSelectionWindow
+	s.mu.Unlock()
+	return int(value % uint64(length))
 }
 
 func effectiveQuotaMode(candidate account.RoutingCandidate, fallback string) string {
@@ -347,17 +514,22 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 		if key.provider != provider {
 			continue
 		}
-		for index := range snapshot.values {
-			candidate := &snapshot.values[index]
-			if candidate.Credential.ID != accountID || candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
-				continue
-			}
-			window := *candidate.QuotaWindow
-			window.Remaining = max(0, window.Remaining-amount)
-			window.UpdatedAt = time.Now().UTC()
-			candidate.QuotaWindow = &window
+		if snapshot.byID == nil {
+			snapshot = buildCandidateSnapshot(snapshot.values, snapshot.expiresAt, s.resolveTierOrder(key.provider, key.upstreamModel))
+			s.candidates[key] = snapshot
 		}
-		s.candidates[key] = snapshot
+		index, ok := snapshot.byID[accountID]
+		if !ok {
+			continue
+		}
+		candidate := snapshotCandidate(snapshot, index)
+		if candidate.QuotaWindow == nil || candidate.QuotaWindow.Mode != mode {
+			continue
+		}
+		window := *candidate.QuotaWindow
+		window.Remaining = max(0, window.Remaining-amount)
+		window.UpdatedAt = time.Now().UTC()
+		snapshot.quotaOverrides.Store(accountID, window)
 	}
 }
 
@@ -382,13 +554,16 @@ func (s *Selector) MarkFailure(ctx context.Context, credential account.Credentia
 	}
 }
 
-func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
+func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string, now time.Time) (candidateSnapshot, error) {
 	key := candidateCacheKey{provider: provider, upstreamModel: upstreamModel, quotaMode: quotaMode}
 	s.mu.Lock()
 	if snapshot, ok := s.candidates[key]; ok && now.Before(snapshot.expiresAt) {
-		values := append([]account.RoutingCandidate(nil), snapshot.values...)
+		if snapshot.byID == nil {
+			snapshot = buildCandidateSnapshot(snapshot.values, snapshot.expiresAt, s.resolveTierOrder(provider, upstreamModel))
+			s.candidates[key] = snapshot
+		}
 		s.mu.Unlock()
-		return values, nil
+		return snapshot, nil
 	}
 	s.mu.Unlock()
 	loadKey := string(provider) + "\x00" + upstreamModel + "\x00" + quotaMode
@@ -396,24 +571,85 @@ func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider
 		checkTime := time.Now().UTC()
 		s.mu.Lock()
 		if snapshot, ok := s.candidates[key]; ok && checkTime.Before(snapshot.expiresAt) {
-			values := append([]account.RoutingCandidate(nil), snapshot.values...)
+			if snapshot.byID == nil {
+				snapshot = buildCandidateSnapshot(snapshot.values, snapshot.expiresAt, s.resolveTierOrder(provider, upstreamModel))
+				s.candidates[key] = snapshot
+			}
 			s.mu.Unlock()
-			return values, nil
+			return snapshot, nil
 		}
 		s.mu.Unlock()
 		values, err := s.accounts.ListRoutingCandidates(ctx, provider, upstreamModel, quotaMode)
 		if err != nil {
-			return nil, err
+			return candidateSnapshot{}, err
 		}
+		snapshot := buildCandidateSnapshot(values, checkTime.Add(candidateCacheTTL), s.resolveTierOrder(provider, upstreamModel))
 		s.mu.Lock()
-		s.candidates[key] = candidateSnapshot{values: append([]account.RoutingCandidate(nil), values...), expiresAt: checkTime.Add(candidateCacheTTL)}
+		s.candidates[key] = snapshot
 		s.mu.Unlock()
-		return values, nil
+		return snapshot, nil
 	})
 	if err != nil {
-		return nil, err
+		return candidateSnapshot{}, err
 	}
-	return append([]account.RoutingCandidate(nil), loaded.([]account.RoutingCandidate)...), nil
+	return loaded.(candidateSnapshot), nil
+}
+
+func buildCandidateSnapshot(values []account.RoutingCandidate, expiresAt time.Time, tierOrder []account.WebTier) candidateSnapshot {
+	type staticKey struct {
+		supports bool
+		known    bool
+		tier     int
+		priority int
+	}
+	buckets := make(map[staticKey][]account.RoutingCandidate, 16)
+	keys := make([]staticKey, 0, 16)
+	for _, candidate := range values {
+		key := staticKey{
+			supports: candidate.SupportsModel, known: candidate.ModelCapabilityKnown,
+			tier: tierOrderRank(tierOrder, candidate.Credential.WebTier), priority: candidate.Credential.Priority,
+		}
+		if _, exists := buckets[key]; !exists {
+			keys = append(keys, key)
+		}
+		buckets[key] = append(buckets[key], candidate)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := keys[i], keys[j]
+		if left.supports != right.supports {
+			return left.supports
+		}
+		if left.known != right.known {
+			return left.known
+		}
+		if left.tier != right.tier {
+			return left.tier < right.tier
+		}
+		return left.priority > right.priority
+	})
+	ordered := make([]account.RoutingCandidate, 0, len(values))
+	groups := make([]candidateGroup, 0, len(keys))
+	for _, key := range keys {
+		start := len(ordered)
+		ordered = append(ordered, buckets[key]...)
+		groups = append(groups, candidateGroup{start: start, end: len(ordered)})
+	}
+	byID := make(map[uint64]int, len(ordered))
+	for index, candidate := range ordered {
+		byID[candidate.Credential.ID] = index
+	}
+	return candidateSnapshot{values: ordered, groups: groups, byID: byID, quotaOverrides: &sync.Map{}, expiresAt: expiresAt}
+}
+
+func snapshotCandidate(snapshot candidateSnapshot, index int) account.RoutingCandidate {
+	candidate := snapshot.values[index]
+	if snapshot.quotaOverrides != nil {
+		if value, ok := snapshot.quotaOverrides.Load(candidate.Credential.ID); ok {
+			window := value.(account.QuotaWindow)
+			candidate.QuotaWindow = &window
+		}
+	}
+	return candidate
 }
 
 func (s *Selector) invalidateCandidates(provider account.Provider) {
@@ -422,6 +658,11 @@ func (s *Selector) invalidateCandidates(provider account.Provider) {
 	for key := range s.candidates {
 		if key.provider == provider {
 			delete(s.candidates, key)
+		}
+	}
+	for key := range s.selectionCursors {
+		if key.cache.provider == provider {
+			delete(s.selectionCursors, key)
 		}
 	}
 }
@@ -444,79 +685,14 @@ func (s *Selector) tryAcquire(ctx context.Context, value account.Credential) (*a
 	return &accountLease{Credential: value, release: release}, nil
 }
 
-func (s *Selector) sortCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierOrder []account.WebTier) error {
-	s.mu.Lock()
-	lastSelected := make(map[uint64]time.Time, len(s.lastSelectedAt))
-	for id, value := range s.lastSelectedAt {
-		lastSelected[id] = value
-	}
-	s.mu.Unlock()
-	remaining := make(map[uint64]float64, len(values))
-	fresh := make(map[uint64]bool, len(values))
-	inFlight := make(map[uint64]int, len(values))
-	concurrencyKeys := make([]string, 0, len(values))
-	for _, candidate := range values {
-		concurrencyKeys = append(concurrencyKeys, fmt.Sprintf("account:%d", candidate.Credential.ID))
-	}
-	concurrencySnapshot := make(map[string]int, len(values))
-	batchReader, batched := s.concurrency.(repository.ConcurrencySnapshotReader)
-	if batched {
-		var err error
-		concurrencySnapshot, err = batchReader.CurrentMany(ctx, concurrencyKeys)
-		if err != nil {
-			return fmt.Errorf("批量读取账号并发租约: %w", err)
-		}
-	}
-	for _, candidate := range values {
-		value := candidate.Credential
-		key := fmt.Sprintf("account:%d", value.ID)
-		current, found := concurrencySnapshot[key]
-		if !batched {
-			var err error
-			current, err = s.concurrency.Current(ctx, key)
-			if err != nil {
-				return fmt.Errorf("读取账号并发租约: %w", err)
-			}
-		} else if !found {
-			current = 0
-		}
-		inFlight[value.ID] = current
-		if candidate.Billing != nil {
-			remaining[value.ID] = candidate.Billing.Remaining()
-			fresh[value.ID] = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
-		}
-	}
-	sort.SliceStable(values, func(i, j int) bool {
-		leftCandidate, rightCandidate := values[i], values[j]
-		left, right := leftCandidate.Credential, rightCandidate.Credential
-		if leftCandidate.SupportsModel != rightCandidate.SupportsModel {
-			return leftCandidate.SupportsModel
-		}
-		if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
-			return leftCandidate.ModelCapabilityKnown
-		}
-		leftTier, rightTier := tierOrderRank(tierOrder, left.WebTier), tierOrderRank(tierOrder, right.WebTier)
-		if leftTier != rightTier {
-			return leftTier < rightTier
-		}
-		if left.Priority != right.Priority {
-			return left.Priority > right.Priority
-		}
-		if fresh[left.ID] != fresh[right.ID] {
-			return fresh[left.ID]
-		}
-		if inFlight[left.ID] != inFlight[right.ID] {
-			return inFlight[left.ID] < inFlight[right.ID]
-		}
-		if remaining[left.ID] != remaining[right.ID] {
-			return remaining[left.ID] > remaining[right.ID]
-		}
-		if !lastSelected[left.ID].Equal(lastSelected[right.ID]) {
-			return lastSelected[left.ID].Before(lastSelected[right.ID])
-		}
-		return left.ID < right.ID
-	})
-	return nil
+// accountTieBreakRank gives equivalent accounts a process-local stable random
+// order. The selector still rotates selected accounts via lastSelectedAt, but
+// a restart no longer concentrates the cold-start load on the lowest IDs.
+func accountTieBreakRank(id, seed uint64) uint64 {
+	value := id + seed + 0x9e3779b97f4a7c15
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	return value ^ (value >> 31)
 }
 
 func (s *Selector) resolveTierOrder(provider account.Provider, upstreamModel string) []account.WebTier {

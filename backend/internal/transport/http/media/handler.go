@@ -21,10 +21,16 @@ func NewHandler(service *mediaapp.Service) *Handler { return &Handler{service: s
 func (h *Handler) RegisterPublic(router *gin.Engine) {
 	router.GET("/v1/media/images/:assetId", h.getImage)
 	router.HEAD("/v1/media/images/:assetId", h.getImage)
+	router.GET("/v1/files/image", h.getImage)
+	router.HEAD("/v1/files/image", h.getImage)
 }
 
 func (h *Handler) getImage(c *gin.Context) {
-	asset, body, err := h.service.OpenImage(c.Request.Context(), c.Param("assetId"))
+	assetID := strings.TrimSpace(c.Param("assetId"))
+	if assetID == "" {
+		assetID = strings.TrimSpace(c.Query("id"))
+	}
+	asset, body, err := h.service.OpenImage(c.Request.Context(), assetID)
 	if errors.Is(err, mediaapp.ErrAssetNotFound) {
 		c.Status(http.StatusNotFound)
 		return

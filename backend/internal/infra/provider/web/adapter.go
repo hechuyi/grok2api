@@ -114,6 +114,16 @@ func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
 	if !ok {
 		return nil
 	}
+	if spec.PreferBest {
+		switch spec.MinimumTier {
+		case account.WebTierHeavy:
+			return []account.WebTier{account.WebTierHeavy}
+		case account.WebTierSuper:
+			return []account.WebTier{account.WebTierHeavy, account.WebTierSuper}
+		default:
+			return []account.WebTier{account.WebTierHeavy, account.WebTierSuper, account.WebTierBasic}
+		}
+	}
 	switch spec.MinimumTier {
 	case account.WebTierHeavy:
 		return []account.WebTier{account.WebTierHeavy}
@@ -125,6 +135,9 @@ func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
 }
 
 func (a *Adapter) PricingModel(upstreamModel string) string {
+	if spec, ok := resolveConsole(upstreamModel); ok {
+		return spec.UpstreamModel
+	}
 	spec, ok := Resolve(upstreamModel)
 	if ok && spec.Capability == modeldomain.CapabilityChat {
 		return "grok-4.5"
@@ -137,8 +150,9 @@ func (a *Adapter) ListModels(_ context.Context, credential account.Credential) (
 	if tier == "" || tier == account.WebTierAuto || tier == account.WebTierBasic {
 		tier = account.WebTierBasic
 	}
-	values := make([]string, 0, len(catalog))
-	for _, spec := range catalog {
+	models := Catalog()
+	values := make([]string, 0, len(models))
+	for _, spec := range models {
 		if TierSupports(tier, spec.MinimumTier) {
 			values = append(values, spec.UpstreamModel)
 		}

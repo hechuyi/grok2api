@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
@@ -19,6 +20,7 @@ import (
 
 const defaultModelSyncWorkers = 25
 const syncFailurePersistTimeout = 5 * time.Second
+const defaultRuntimeRevisionPollInterval = time.Second
 
 var (
 	ErrInvalidFilter = errors.New("模型筛选条件无效")
@@ -55,17 +57,35 @@ type ListFilter struct {
 
 // Service 负责上游模型发现与公开模型别名维护。
 type Service struct {
-	models    repository.ModelRepository
-	accounts  repository.AccountRepository
-	account   *accountapp.Service
-	providers *provider.Registry
-	bulkPool  *batch.Pool
-	logger    *slog.Logger
-	syncAll   singleflight.Group
+	models                      repository.ModelRepository
+	accounts                    repository.AccountRepository
+	account                     *accountapp.Service
+	providers                   *provider.Registry
+	bulkPool                    *batch.Pool
+	logger                      *slog.Logger
+	syncAll                     singleflight.Group
+	runtimeLoad                 singleflight.Group
+	runtimeCatalog              atomic.Pointer[runtimeCatalog]
+	runtimeRevisionCheckAt      atomic.Int64
+	runtimeRevisionPollInterval time.Duration
+}
+
+type runtimeRevisionRepository interface {
+	RuntimeRevision(ctx context.Context) (uint64, error)
+}
+
+type runtimeCatalog struct {
+	revision   uint64
+	routes     []modeldomain.Route
+	byPublicID map[string]modeldomain.Route
 }
 
 func NewService(models repository.ModelRepository, accounts repository.AccountRepository, accountService *accountapp.Service, providers *provider.Registry) *Service {
-	return &Service{models: models, accounts: accounts, account: accountService, providers: providers, bulkPool: batch.NewPool(defaultModelSyncWorkers), logger: slog.Default()}
+	return &Service{
+		models: models, accounts: accounts, account: accountService, providers: providers,
+		bulkPool: batch.NewPool(defaultModelSyncWorkers), logger: slog.Default(),
+		runtimeRevisionPollInterval: defaultRuntimeRevisionPollInterval,
+	}
 }
 
 func (s *Service) SetBulkPool(pool *batch.Pool) {
@@ -103,12 +123,181 @@ func validModelFilter(value string, allowed ...string) bool {
 }
 
 func (s *Service) ListEnabled(ctx context.Context) ([]modeldomain.Route, error) {
-	return s.models.ListEnabled(ctx)
+	catalog, err := s.loadRuntimeCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	values := cloneRoutes(catalog.routes)
+	result := values[:0]
+	for _, value := range values {
+		if !IsLegacyV2OnlyModel(value.PublicID) {
+			result = append(result, value)
+		}
+	}
+	return result, nil
 }
 
-// GetByPublicID 每次读取共享主数据库，保证多实例下的路由禁用立即生效。
+// ListLegacyV2Enabled preserves the v2 model order and only synthesizes the
+// old public contract for legacy clients. Native v3 clients keep the canonical
+// repository view.
+func (s *Service) ListLegacyV2Enabled(ctx context.Context) ([]modeldomain.Route, error) {
+	catalog, err := s.loadRuntimeCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	canonical := catalog.routes
+	byPublicID := make(map[string]modeldomain.Route, len(canonical))
+	for _, value := range canonical {
+		byPublicID[value.PublicID] = value
+	}
+	result := make([]modeldomain.Route, 0, len(canonical)+len(legacyV2Models))
+	for _, legacy := range legacyV2Models {
+		routingID, _ := LegacyV2RoutingID(legacy.PublicID)
+		target, ok := byPublicID[routingID]
+		if !ok {
+			target, ok = byPublicID[legacy.CanonicalID]
+		}
+		if !ok {
+			continue
+		}
+		target.PublicID = legacy.PublicID
+		target.Capability = legacy.Capability
+		result = append(result, target)
+	}
+	return result, nil
+}
+
+// GetByPublicID 从不可变运行时目录读取；多实例通过数据库修订号在有限时间内收敛。
 func (s *Service) GetByPublicID(ctx context.Context, publicID string) (modeldomain.Route, error) {
-	return s.models.GetByPublicID(ctx, publicID)
+	catalog, err := s.loadRuntimeCatalog(ctx)
+	if err != nil {
+		return modeldomain.Route{}, err
+	}
+	if value, ok := catalog.byPublicID[publicID]; ok {
+		return cloneRoute(value), nil
+	}
+	legacy, ok := legacyV2ModelsByPublicID[publicID]
+	if !ok {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	value, ok := catalog.byPublicID[legacy.CanonicalID]
+	if !ok {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	return cloneRoute(value), nil
+}
+
+func (s *Service) GetLegacyV2ByPublicID(ctx context.Context, publicID string) (modeldomain.Route, error) {
+	legacy, ok := legacyV2ModelsByPublicID[publicID]
+	if !ok {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	catalog, err := s.loadRuntimeCatalog(ctx)
+	if err != nil {
+		return modeldomain.Route{}, err
+	}
+	routingID, _ := LegacyV2RoutingID(publicID)
+	if value, exists := catalog.byPublicID[routingID]; exists {
+		return cloneRoute(value), nil
+	}
+	value, exists := catalog.byPublicID[legacy.CanonicalID]
+	if !exists {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	return cloneRoute(value), nil
+}
+
+func (s *Service) loadRuntimeCatalog(ctx context.Context) (*runtimeCatalog, error) {
+	current := s.runtimeCatalog.Load()
+	revisions, versioned := s.models.(runtimeRevisionRepository)
+	if current != nil {
+		if !versioned {
+			return current, nil
+		}
+		now := time.Now().UnixNano()
+		if interval := s.runtimeRevisionPollInterval; interval > 0 && now < s.runtimeRevisionCheckAt.Load() {
+			return current, nil
+		}
+	}
+
+	loaded, err, _ := s.runtimeLoad.Do("runtime-catalog", func() (any, error) {
+		current := s.runtimeCatalog.Load()
+		if current != nil && !versioned {
+			return current, nil
+		}
+		now := time.Now()
+		if current != nil && s.runtimeRevisionPollInterval > 0 && now.UnixNano() < s.runtimeRevisionCheckAt.Load() {
+			return current, nil
+		}
+
+		var revision uint64
+		if versioned {
+			value, err := revisions.RuntimeRevision(ctx)
+			if err != nil {
+				if current != nil {
+					s.logger.Warn("model_runtime_revision_failed", "error", err)
+					return current, nil
+				}
+				return nil, err
+			}
+			revision = value
+			s.runtimeRevisionCheckAt.Store(now.Add(s.runtimeRevisionPollInterval).UnixNano())
+			if current != nil && current.revision == revision {
+				return current, nil
+			}
+		}
+
+		for attempt := 0; attempt < 3; attempt++ {
+			routes, err := s.models.ListEnabled(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if versioned {
+				latest, err := revisions.RuntimeRevision(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if latest != revision {
+					revision = latest
+					continue
+				}
+			}
+			next := newRuntimeCatalog(revision, routes)
+			s.runtimeCatalog.Store(next)
+			return next, nil
+		}
+		return nil, fmt.Errorf("模型运行时目录在加载期间持续变化")
+	})
+	if err != nil {
+		return nil, err
+	}
+	return loaded.(*runtimeCatalog), nil
+}
+
+func newRuntimeCatalog(revision uint64, routes []modeldomain.Route) *runtimeCatalog {
+	immutable := cloneRoutes(routes)
+	byPublicID := make(map[string]modeldomain.Route, len(immutable))
+	for _, route := range immutable {
+		byPublicID[route.PublicID] = route
+	}
+	return &runtimeCatalog{revision: revision, routes: immutable, byPublicID: byPublicID}
+}
+
+func cloneRoutes(values []modeldomain.Route) []modeldomain.Route {
+	result := make([]modeldomain.Route, len(values))
+	for index, value := range values {
+		result[index] = cloneRoute(value)
+	}
+	return result
+}
+
+func cloneRoute(value modeldomain.Route) modeldomain.Route {
+	value.BoundAccountIDs = append([]uint64(nil), value.BoundAccountIDs...)
+	if value.LastSyncedAt != nil {
+		lastSyncedAt := *value.LastSyncedAt
+		value.LastSyncedAt = &lastSyncedAt
+	}
+	return value
 }
 
 func (s *Service) Create(ctx context.Context, input CreateInput) (modeldomain.Route, error) {
@@ -135,7 +324,11 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (modeldomain.Ro
 		Capability: input.Capability, Origin: modeldomain.OriginManual, Enabled: input.Enabled,
 	}
 	created, err := s.models.Create(ctx, value, accountIDs)
-	return created, mapRepositoryError(err)
+	if err != nil {
+		return modeldomain.Route{}, mapRepositoryError(err)
+	}
+	s.invalidateRuntimeCatalog()
+	return created, nil
 }
 
 func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (modeldomain.Route, error) {
@@ -162,14 +355,22 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (mod
 		accountIDs = &validated
 	}
 	updated, err := s.models.Update(ctx, value, accountIDs)
-	return updated, mapRepositoryError(err)
+	if err != nil {
+		return modeldomain.Route{}, mapRepositoryError(err)
+	}
+	s.invalidateRuntimeCatalog()
+	return updated, nil
 }
 
 func (s *Service) Delete(ctx context.Context, id uint64) error {
 	if id == 0 {
 		return invalidInput("模型 ID 无效")
 	}
-	return mapRepositoryError(s.models.Delete(ctx, id))
+	if err := s.models.Delete(ctx, id); err != nil {
+		return mapRepositoryError(err)
+	}
+	s.invalidateRuntimeCatalog()
+	return nil
 }
 
 func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) {
@@ -177,7 +378,11 @@ func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
-	return s.models.DeleteMany(ctx, values)
+	deleted, err := s.models.DeleteMany(ctx, values)
+	if err == nil && deleted > 0 {
+		s.invalidateRuntimeCatalog()
+	}
+	return deleted, err
 }
 
 func (s *Service) ListBindableAccounts(ctx context.Context, providerValue account.Provider) ([]AccountOption, error) {
@@ -260,6 +465,9 @@ func (s *Service) BatchSetEnabled(ctx context.Context, ids []uint64, enabled boo
 		return 0, err
 	}
 	updated, err := s.models.UpdateManyEnabled(ctx, values, enabled)
+	if err == nil && updated > 0 {
+		s.invalidateRuntimeCatalog()
+	}
 	return updated, err
 }
 
@@ -351,6 +559,7 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 		}
 		syncedModels += len(models)
 	}
+	s.invalidateRuntimeCatalog()
 	return syncedModels, nil
 }
 
@@ -376,7 +585,12 @@ func (s *Service) SyncAccount(ctx context.Context, accountID uint64) (int, error
 	if err := s.models.UpsertDiscovered(ctx, credential.Provider, models); err != nil {
 		return 0, err
 	}
+	s.invalidateRuntimeCatalog()
 	return len(models), nil
+}
+
+func (s *Service) invalidateRuntimeCatalog() {
+	s.runtimeRevisionCheckAt.Store(0)
 }
 
 func (s *Service) syncAccountCapabilities(ctx context.Context, value account.Credential, adapter provider.ModelCatalogAdapter) ([]string, error) {

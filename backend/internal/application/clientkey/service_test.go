@@ -57,6 +57,46 @@ func TestCreateUsesG2AClientKeyFormat(t *testing.T) {
 	}
 }
 
+func TestAuthenticateAcceptsPersistedLegacyV2Key(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "legacy-client-key.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := "legacy-key-123"
+	prefix, ok := security.ClientKeyLookupPrefix(raw)
+	if !ok {
+		t.Fatal("legacy client key was rejected")
+	}
+	cipher := testCipher(t)
+	encrypted, err := cipher.Encrypt(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewClientKeyRepository(database)
+	created, err := repo.Create(ctx, clientkeydomain.Key{
+		Name: "legacy-v2", Prefix: prefix, SecretHash: security.HashToken(raw), EncryptedSecret: encrypted, Enabled: true,
+		RPMLimit: 60, MaxConcurrent: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value, release, err := NewService(repo, successfulRateLimiter{}, successfulConcurrencyLimiter{}, 60, 5, cipher).Authenticate(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if value.ID != created.ID {
+		t.Fatalf("authenticated key ID = %d, want %d", value.ID, created.ID)
+	}
+}
+
 func TestAuthenticateDistinguishesRuntimeStoreFailures(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "runtime-errors.db"))

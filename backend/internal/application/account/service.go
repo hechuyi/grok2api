@@ -1244,6 +1244,12 @@ func (s *Service) DecrementWebQuota(ctx context.Context, id uint64, mode string,
 }
 
 func (s *Service) ExhaustWebQuota(ctx context.Context, id uint64, mode string, resetAt *time.Time) error {
+	if mode == accountdomain.ConsoleQuotaMode {
+		minimum := s.now().Add(accountdomain.ConsoleQuotaRateLimitCooldown)
+		if resetAt == nil || resetAt.Before(minimum) {
+			resetAt = &minimum
+		}
+	}
 	if resetAt == nil {
 		windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{id})
 		if err == nil {

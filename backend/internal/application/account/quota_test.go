@@ -1,10 +1,13 @@
 package account
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 )
 
 func TestNewQuotaViewFreeUsesObservedRollingTokens(t *testing.T) {
@@ -65,5 +68,48 @@ func TestNewQuotaViewUsesConfirmedExhaustion(t *testing.T) {
 	}
 	if quota.Used != 1_065_387 || quota.Limit != 1_000_000 || quota.Remaining != 0 || quota.NextProbeAt == nil || !quota.LimitKnown {
 		t.Fatalf("quota = %#v", quota)
+	}
+}
+
+func TestConsole429UsesIndependentFourHourCooldown(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-429.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAccountRepository(database)
+	credential, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "console-429",
+		SourceKey: "console-429", EncryptedAccessToken: "encrypted", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	shortReset := now.Add(30 * time.Minute)
+	if err := repository.SaveQuotaWindows(ctx, credential.ID, accountdomain.WebTierBasic, now, []accountdomain.QuotaWindow{{
+		AccountID: credential.ID, Mode: accountdomain.ConsoleQuotaMode, Remaining: 12, Total: accountdomain.ConsoleQuotaLimit,
+		WindowSeconds: int(accountdomain.ConsoleQuotaWindow / time.Second), ResetAt: &shortReset, SyncedAt: &now,
+		Source: accountdomain.QuotaSourceEstimated, UpdatedAt: now,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repository, nil, nil, nil, nil, nil, nil)
+	service.now = func() time.Time { return now }
+	exhausted, err := service.ReconcileWebRateLimit(ctx, credential.ID, accountdomain.ConsoleQuotaMode, 0)
+	if err != nil || !exhausted {
+		t.Fatalf("exhausted=%v err=%v", exhausted, err)
+	}
+	windows, err := repository.GetQuotaWindows(ctx, []uint64{credential.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := windows[credential.ID][0]
+	if window.Remaining != 0 || window.ResetAt == nil || !window.ResetAt.Equal(now.Add(accountdomain.ConsoleQuotaRateLimitCooldown)) {
+		t.Fatalf("window = %#v", window)
 	}
 }

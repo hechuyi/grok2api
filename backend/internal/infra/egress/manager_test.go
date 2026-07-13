@@ -2,7 +2,10 @@ package egress
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -115,6 +118,31 @@ func TestEgressNodeSnapshotAvoidsRepeatedRepositoryReads(t *testing.T) {
 	}
 	if repository.calls != 1 {
 		t.Fatalf("repository reads = %d, want 1", repository.calls)
+	}
+}
+
+func TestAffinityRemainsStickyAcrossRecoverableHealthDifferences(t *testing.T) {
+	manager := &Manager{}
+	nodes := []domain.Node{
+		{ID: 1, Health: 1},
+		{ID: 2, Health: 0.7},
+		{ID: 3, Health: 0.7},
+		{ID: 4, Health: 0.7},
+	}
+	affinity := ""
+	for candidate := 0; candidate < 100; candidate++ {
+		value := fmt.Sprintf("account-%d", candidate)
+		digest := sha256.Sum256([]byte(value))
+		if binary.BigEndian.Uint64(digest[:8])%uint64(len(nodes)) == 1 {
+			affinity = value
+			break
+		}
+	}
+	if affinity == "" {
+		t.Fatal("failed to construct affinity fixture")
+	}
+	if selected := manager.selectNode(nodes, affinity); selected.ID != 2 {
+		t.Fatalf("sticky affinity selected node %d, want 2", selected.ID)
 	}
 }
 

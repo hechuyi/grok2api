@@ -348,11 +348,31 @@ func TestSelectorUsesBatchConcurrencySnapshot(t *testing.T) {
 		{Credential: account.Credential{ID: 1, Priority: 1}},
 		{Credential: account.Credential{ID: 2, Priority: 1}},
 	}
-	if err := selector.sortCandidates(context.Background(), values, time.Now().UTC(), nil); err != nil {
+	ranked, err := selector.rankCandidateWindow(context.Background(), values, time.Now().UTC())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if limiter.batchCalls != 1 || limiter.currentCalls != 0 || values[0].Credential.ID != 2 {
-		t.Fatalf("batchCalls=%d currentCalls=%d values=%#v", limiter.batchCalls, limiter.currentCalls, values)
+	if limiter.batchCalls != 1 || limiter.currentCalls != 0 || ranked[0].candidate.Credential.ID != 2 {
+		t.Fatalf("batchCalls=%d currentCalls=%d ranked=%#v", limiter.batchCalls, limiter.currentCalls, ranked)
+	}
+}
+
+func TestSelectorColdStartDispersesEquivalentAccounts(t *testing.T) {
+	firstIDs := make(map[uint64]bool)
+	for range 32 {
+		selector := NewSelector(nil, memory.NewConcurrencyLimiter(), nil, nil, time.Hour, time.Second, time.Minute)
+		values := make([]account.RoutingCandidate, 8)
+		for index := range values {
+			values[index].Credential = account.Credential{ID: uint64(index + 1), Priority: 100}
+		}
+		ranked, err := selector.rankCandidateWindow(context.Background(), values, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstIDs[ranked[0].candidate.Credential.ID] = true
+	}
+	if len(firstIDs) == 1 {
+		t.Fatalf("equivalent cold-start accounts always selected the same first ID: %v", firstIDs)
 	}
 }
 
@@ -364,7 +384,8 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 		}}},
 	}}
 	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 3)
-	window := selector.candidates[key].values[0].QuotaWindow
+	snapshot := selector.candidates[key]
+	window := snapshotCandidate(snapshot, 0).QuotaWindow
 	if window == nil || window.Remaining != 7 {
 		t.Fatalf("quota window = %#v", window)
 	}

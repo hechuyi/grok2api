@@ -85,6 +85,77 @@ func TestModelCapabilitiesAggregateAndGateEnabledRoutes(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelCatalogRevisionAndReverseCapabilityIndex(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	models := NewModelRepository(database)
+	accounts := NewAccountRepository(database)
+
+	if !database.db.Migrator().HasIndex(&accountModelCapabilityModel{}, "idx_account_model_capabilities_upstream_account") {
+		t.Fatal("missing reverse capability index")
+	}
+	initial, err := models.RuntimeRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "runtime-revision", SourceKey: "runtime-revision",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterAccount, err := models.RuntimeRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterAccount != initial+1 {
+		t.Fatalf("revision after account insert = %d, want %d", afterAccount, initial+1)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-runtime"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	afterCapabilities, err := models.RuntimeRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCapabilities != afterAccount+1 {
+		t.Fatalf("revision after capability replace = %d, want %d", afterCapabilities, afterAccount+1)
+	}
+	created, err := models.Create(ctx, model.Route{
+		PublicID: "grok-runtime", Provider: account.ProviderBuild, UpstreamModel: "grok-runtime",
+		Capability: model.CapabilityResponses, Origin: model.OriginManual, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRoute, err := models.RuntimeRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRoute != afterCapabilities+1 {
+		t.Fatalf("revision after route insert = %d, want %d", afterRoute, afterCapabilities+1)
+	}
+
+	runtimeRoutes, err := models.ListEnabled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtimeRoutes) != 1 || runtimeRoutes[0].ID != created.ID {
+		t.Fatalf("runtime routes = %#v", runtimeRoutes)
+	}
+	if runtimeRoutes[0].SupportedAccounts != 0 || runtimeRoutes[0].SyncedAccounts != 0 || runtimeRoutes[0].TotalAccounts != 0 || runtimeRoutes[0].LastSyncedAt != nil {
+		t.Fatalf("runtime route unexpectedly contains admin aggregates: %#v", runtimeRoutes[0])
+	}
+	adminRoutes, _, err := models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adminRoutes) != 1 || adminRoutes[0].SupportedAccounts != 1 || adminRoutes[0].SyncedAccounts != 1 {
+		t.Fatalf("admin aggregates = %#v", adminRoutes)
+	}
+}
+
 func TestReplaceProviderRoutesReconcilesStaticCatalog(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)

@@ -39,7 +39,7 @@ func TestWebResponseStateAndMediaJobRoundTrip(t *testing.T) {
 	}
 
 	jobs := NewMediaJobRepository(database)
-	job := mediadomain.Job{ID: "video_test", RequestID: "request-video-test", ClientKeyID: key.ID, ClientKeyName: key.Name, AccountID: accountValue.ID, AccountName: accountValue.Name, Provider: "grok_web", Model: "grok-imagine-video", ModelRouteID: 1, UpstreamModel: "video", Prompt: "test", Seconds: 8, Size: "16:9", Quality: "720p", Status: mediadomain.StatusQueued, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now}
+	job := mediadomain.Job{ID: "video_test", RequestID: "request-video-test", ClientKeyID: key.ID, ClientKeyName: key.Name, AccountID: accountValue.ID, AccountName: accountValue.Name, Provider: "grok_web", Model: "grok-imagine-video", ModelRouteID: 1, UpstreamModel: "video", Prompt: "test", Seconds: 20, Size: "16:9", Quality: "720p", Status: mediadomain.StatusQueued, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now}
 	if err := jobs.CreateMediaJob(ctx, job); err != nil {
 		t.Fatal(err)
 	}

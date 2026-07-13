@@ -18,26 +18,28 @@ import (
 type ModelRepository struct{ db *Database }
 
 const availableRoutePredicate = `
-	EXISTS (
-		SELECT 1 FROM provider_accounts account
-		WHERE account.provider = model_routes.provider
-			AND account.enabled = ?
-			AND account.auth_status = ?
-			AND (
-				EXISTS (
-					SELECT 1 FROM model_route_accounts binding
-					WHERE binding.model_route_id = model_routes.id
-						AND binding.account_id = account.id
-				)
-				OR (
-					NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
-					AND EXISTS (
-						SELECT 1 FROM account_model_capabilities capability
-						WHERE capability.account_id = account.id
-							AND capability.upstream_model = model_routes.upstream_model
-					)
-				)
+	(
+		EXISTS (
+			SELECT 1
+			FROM model_route_accounts binding
+			JOIN provider_accounts account ON account.id = binding.account_id
+			WHERE binding.model_route_id = model_routes.id
+				AND account.provider = model_routes.provider
+				AND account.enabled = ?
+				AND account.auth_status = ?
+		)
+		OR (
+			NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
+			AND EXISTS (
+				SELECT 1
+				FROM account_model_capabilities capability
+				JOIN provider_accounts account ON account.id = capability.account_id
+				WHERE capability.upstream_model = model_routes.upstream_model
+					AND account.provider = model_routes.provider
+					AND account.enabled = ?
+					AND account.auth_status = ?
 			)
+		)
 	)
 `
 
@@ -88,11 +90,15 @@ func (r *ModelRepository) ListEnabled(ctx context.Context) ([]model.Route, error
 	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("enabled = ?", true).Order("public_id ASC, id ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	values := mapModelRows(rows)
-	if err := r.annotateAvailability(ctx, values); err != nil {
-		return nil, err
+	return mapModelRows(rows), nil
+}
+
+func (r *ModelRepository) RuntimeRevision(ctx context.Context) (uint64, error) {
+	var state modelRuntimeStateModel
+	if err := r.db.db.WithContext(ctx).First(&state, "id = ?", 1).Error; err != nil {
+		return 0, mapError(err)
 	}
-	return values, nil
+	return uint64(state.Revision), nil
 }
 
 func (r *ModelRepository) Get(ctx context.Context, id uint64) (model.Route, error) {
@@ -139,7 +145,10 @@ func (r *ModelRepository) ReplaceAccountCapabilities(ctx context.Context, accoun
 			}
 		}
 		state := accountModelSyncStateModel{AccountID: accountID, LastAttemptAt: syncedAt, LastSuccessAt: &syncedAt}
-		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: clause.AssignmentColumns([]string{"last_attempt_at", "last_success_at", "last_error"})}).Create(&state).Error
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: clause.AssignmentColumns([]string{"last_attempt_at", "last_success_at", "last_error"})}).Create(&state).Error; err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
 	})
 }
 
@@ -191,7 +200,13 @@ func (r *ModelRepository) UpsertDiscovered(ctx context.Context, provider account
 		}
 		if len(rows) > 0 {
 			// 多实例可能同时发现同一上游模型；唯一约束负责最终幂等，避免竞态变成整批失败。
-			return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(rows, 200).Error
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(rows, 200)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected > 0 {
+				return bumpModelRuntimeRevision(tx)
+			}
 		}
 		return nil
 	})
@@ -215,6 +230,7 @@ func discoveredRouteDefaults(provider account.Provider, upstreamModel string) (s
 
 func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route) error {
 	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		changed := false
 		for _, value := range values {
 			if strings.TrimSpace(value.PublicID) == "" || strings.TrimSpace(value.UpstreamModel) == "" || value.Provider == "" || value.Capability == "" {
 				return fmt.Errorf("模型路由目录包含无效条目")
@@ -235,6 +251,10 @@ func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route
 			if err := tx.Create(&row).Error; err != nil {
 				return mapError(err)
 			}
+			changed = true
+		}
+		if changed {
+			return bumpModelRuntimeRevision(tx)
 		}
 		return nil
 	})
@@ -312,7 +332,7 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 				return mapError(err)
 			}
 		}
-		return nil
+		return bumpModelRuntimeRevision(tx)
 	})
 }
 
@@ -342,7 +362,7 @@ func (r *ModelRepository) Create(ctx context.Context, value model.Route, account
 		if err := replaceModelRouteAccounts(tx, row.ID, accountIDs); err != nil {
 			return err
 		}
-		return nil
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return model.Route{}, err
@@ -369,9 +389,11 @@ func (r *ModelRepository) Update(ctx context.Context, value model.Route, account
 			}
 		}
 		if accountIDs != nil {
-			return replaceModelRouteAccounts(tx, value.ID, *accountIDs)
+			if err := replaceModelRouteAccounts(tx, value.ID, *accountIDs); err != nil {
+				return err
+			}
 		}
-		return nil
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return model.Route{}, err
@@ -380,22 +402,35 @@ func (r *ModelRepository) Update(ctx context.Context, value model.Route, account
 }
 
 func (r *ModelRepository) Delete(ctx context.Context, id uint64) error {
-	result := r.db.db.WithContext(ctx).Delete(&modelRouteModel{}, id)
-	if result.Error != nil {
-		return mapError(result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
-	}
-	return nil
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Delete(&modelRouteModel{}, id)
+		if result.Error != nil {
+			return mapError(result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return repository.ErrNotFound
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
 }
 
 func (r *ModelRepository) DeleteMany(ctx context.Context, ids []uint64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Where("id IN ?", ids).Delete(&modelRouteModel{})
-	return result.RowsAffected, mapError(result.Error)
+	var deleted int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id IN ?", ids).Delete(&modelRouteModel{})
+		if result.Error != nil {
+			return mapError(result.Error)
+		}
+		deleted = result.RowsAffected
+		if deleted == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return deleted, err
 }
 
 func replaceModelRouteAccounts(tx *gorm.DB, routeID uint64, accountIDs []uint64) error {
@@ -416,12 +451,37 @@ func (r *ModelRepository) UpdateManyEnabled(ctx context.Context, ids []uint64, e
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&modelRouteModel{}).Where("id IN ?", ids).Update("enabled", enabled)
-	return result.RowsAffected, result.Error
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&modelRouteModel{}).Where("id IN ?", ids).Update("enabled", enabled)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		if updated == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return updated, err
 }
 
 func (r *ModelRepository) availableRoutes(query *gorm.DB) *gorm.DB {
-	return query.Where(availableRoutePredicate, true, account.AuthStatusActive)
+	return query.Where(availableRoutePredicate, true, account.AuthStatusActive, true, account.AuthStatusActive)
+}
+
+func bumpModelRuntimeRevision(tx *gorm.DB) error {
+	result := tx.Model(&modelRuntimeStateModel{}).Where("id = ?", 1).Updates(map[string]any{
+		"revision":   gorm.Expr("revision + 1"),
+		"updated_at": time.Now().UTC(),
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("模型运行时修订号不存在")
+	}
+	return nil
 }
 
 func (r *ModelRepository) annotateAvailability(ctx context.Context, values []model.Route) error {

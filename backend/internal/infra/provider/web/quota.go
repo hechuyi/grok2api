@@ -48,6 +48,14 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 }
 
 func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error) {
+	if mode == account.ConsoleQuotaMode {
+		now := time.Now().UTC()
+		return account.QuotaWindow{
+			AccountID: credential.ID, Mode: mode, Remaining: account.ConsoleQuotaLimit, Total: account.ConsoleQuotaLimit,
+			WindowSeconds: int(account.ConsoleQuotaWindow / time.Second), SyncedAt: &now,
+			Source: account.QuotaSourceEstimated, UpdatedAt: now,
+		}, nil
+	}
 	if mode == weeklyQuotaMode {
 		return a.syncWeeklyCredits(ctx, credential)
 	}

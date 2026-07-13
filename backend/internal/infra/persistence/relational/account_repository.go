@@ -159,7 +159,9 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 	if provider == account.ProviderWeb && len(ids) > 0 {
 		var rows []quotaWindowModel
 		modes := []string{"weekly"}
-		if quotaMode != "" {
+		if quotaMode == account.ConsoleQuotaMode {
+			modes = []string{account.ConsoleQuotaMode}
+		} else if quotaMode != "" {
 			modes = append(modes, quotaMode)
 		}
 		if err := r.db.db.WithContext(ctx).Where("account_id IN ? AND mode IN ?", ids, modes).Order("CASE WHEN mode = 'weekly' THEN 0 ELSE 1 END").Find(&rows).Error; err != nil {
@@ -352,7 +354,10 @@ func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
 		result, err = upsertAccountByIdentity(tx, value)
-		return err
+		if err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return account.Credential{}, false, mapError(err)
@@ -393,7 +398,7 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 			results[index] = result
 			existingByIdentity[stored.IdentityKey] = stored
 		}
-		return nil
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return nil, mapError(err)
@@ -464,7 +469,10 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 		if err := tx.Save(&row).Error; err != nil {
 			return err
 		}
-		return saveAccountRelations(tx, value, row.ID)
+		if err := saveAccountRelations(tx, value, row.ID); err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
 	}); err != nil {
 		return account.Credential{}, mapError(err)
 	}
@@ -503,27 +511,55 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, ids []uint64, update
 	if len(values) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
-	return result.RowsAffected, result.Error
+	if updates.Enabled == nil {
+		result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
+		return result.RowsAffected, result.Error
+	}
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		if updated == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return updated, err
 }
 
 func (r *AccountRepository) Delete(ctx context.Context, id uint64) error {
-	result := r.db.db.WithContext(ctx).Delete(&accountModel{}, id)
-	if result.Error != nil {
-		return mapError(result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
-	}
-	return nil
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Delete(&accountModel{}, id)
+		if result.Error != nil {
+			return mapError(result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return repository.ErrNotFound
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
 }
 
 func (r *AccountRepository) DeleteMany(ctx context.Context, ids []uint64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Where("id IN ?", ids).Delete(&accountModel{})
-	return result.RowsAffected, result.Error
+	var deleted int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id IN ?", ids).Delete(&accountModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		if deleted == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return deleted, err
 }
 
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
@@ -532,10 +568,20 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 		updates["encrypted_refresh"] = refreshToken
 	}
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current struct{ AuthStatus string }
+		if err := tx.Model(&accountModel{}).Select("auth_status").Where("id = ?", id).Take(&current).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
 			return err
 		}
-		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": ""}).Error
+		if err := tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": ""}).Error; err != nil {
+			return err
+		}
+		if current.AuthStatus != string(account.AuthStatusActive) {
+			return bumpModelRuntimeRevision(tx)
+		}
+		return nil
 	}); err != nil {
 		return account.Credential{}, err
 	}
@@ -713,6 +759,34 @@ func (r *AccountRepository) DecrementQuotaWindowBy(ctx context.Context, accountI
 	if amount <= 0 {
 		amount = 1
 	}
+	if mode == account.ConsoleQuotaMode {
+		decrement := func() (*gorm.DB, error) {
+			result := r.db.db.WithContext(ctx).Model(&quotaWindowModel{}).
+				Where("account_id = ? AND mode = ? AND remaining > 0", accountID, mode).
+				Updates(map[string]any{
+					"remaining":  gorm.Expr("CASE WHEN remaining <= ? THEN 0 ELSE remaining - ? END", amount, amount),
+					"updated_at": now,
+				})
+			return result, result.Error
+		}
+		result, err := decrement()
+		if err != nil || result.RowsAffected == 1 {
+			return result.RowsAffected == 1, err
+		}
+		resetAt := now.Add(account.ConsoleQuotaWindow)
+		row := quotaWindowModel{
+			AccountID: accountID, Mode: mode, Remaining: max(0, account.ConsoleQuotaLimit-amount), Total: account.ConsoleQuotaLimit,
+			BreakdownJSON: "[]", WindowSeconds: int(account.ConsoleQuotaWindow / time.Second), ResetAt: &resetAt,
+			SyncedAt: &now, Source: string(account.QuotaSourceEstimated), UpdatedAt: now,
+		}
+		created := r.db.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+		if created.Error != nil || created.RowsAffected == 1 {
+			return created.RowsAffected == 1, created.Error
+		}
+		// Another request inserted the first-use row after our initial UPDATE.
+		result, err = decrement()
+		return result.RowsAffected == 1, err
+	}
 	result := r.db.db.WithContext(ctx).Model(&quotaWindowModel{}).
 		Where("account_id = ? AND mode = ? AND remaining > 0", accountID, mode).
 		Updates(map[string]any{
@@ -723,6 +797,24 @@ func (r *AccountRepository) DecrementQuotaWindowBy(ctx context.Context, accountI
 }
 
 func (r *AccountRepository) ExhaustQuotaWindow(ctx context.Context, accountID uint64, mode string, resetAt *time.Time, now time.Time) error {
+	if mode == account.ConsoleQuotaMode {
+		if resetAt == nil {
+			value := now.Add(account.ConsoleQuotaRateLimitCooldown)
+			resetAt = &value
+		}
+		row := quotaWindowModel{
+			AccountID: accountID, Mode: mode, Remaining: 0, Total: account.ConsoleQuotaLimit,
+			BreakdownJSON: "[]", WindowSeconds: int(account.ConsoleQuotaWindow / time.Second), ResetAt: resetAt,
+			SyncedAt: &now, Source: string(account.QuotaSourceEstimated), UpdatedAt: now,
+		}
+		return r.db.db.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "account_id"}, {Name: "mode"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"remaining": 0, "total": account.ConsoleQuotaLimit, "window_seconds": int(account.ConsoleQuotaWindow / time.Second),
+				"reset_at": resetAt, "source": string(account.QuotaSourceEstimated), "updated_at": now,
+			}),
+		}).Create(&row).Error
+	}
 	return r.db.db.WithContext(ctx).Model(&quotaWindowModel{}).Where("account_id = ? AND mode = ?", accountID, mode).
 		Updates(map[string]any{"remaining": 0, "reset_at": resetAt, "updated_at": now}).Error
 }
