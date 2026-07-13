@@ -6,6 +6,7 @@ configuration loading and clearance refresh lifecycle.
 """
 
 import asyncio
+import hashlib
 from urllib.parse import urlparse
 
 from app.platform.logging.logger import logger
@@ -55,9 +56,10 @@ class ProxyDirectory:
         self._egress_mode: EgressMode = EgressMode.DIRECT
         self._clearance_mode: ClearanceMode = ClearanceMode.NONE
         self._config_sig: tuple | None = None
-        # Pool cursor for PROXY_POOL mode: sticky routing with failure-driven rotate.
-        # Incremented on node failure; all callers see the same cursor under _lock.
+        # Independent offsets keep ordinary round-robin traffic from remapping
+        # account-affine requests. Failures advance both under ``_lock``.
         self._pool_cursor: int = 0
+        self._affinity_offset: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -123,6 +125,7 @@ class ProxyDirectory:
             self._nodes = nodes
             self._resource_nodes = resource_nodes
             self._pool_cursor = 0
+            self._affinity_offset = 0
             self._bundles = {
                 key: bundle.model_copy(update={"state": ClearanceBundleState.INVALID})
                 for key, bundle in self._bundles.items()
@@ -154,12 +157,16 @@ class ProxyDirectory:
         kind: RequestKind = RequestKind.HTTP,
         resource: bool = False,
         clearance_origin: str | None = None,
+        affinity_key: str | None = None,
     ) -> ProxyLease:
         """Return a ProxyLease for the next request.
 
         For DIRECT mode, returns a lease with no proxy or clearance.
         """
-        proxy_url = await self._pick_proxy_url(resource=resource)
+        proxy_url = await self._pick_proxy_url(
+            resource=resource,
+            affinity_key=affinity_key,
+        )
         affinity = proxy_url or "direct"
         clearance_host = _clearance_host(clearance_origin)
 
@@ -213,6 +220,7 @@ class ProxyDirectory:
         ):
             async with self._lock:
                 self._pool_cursor += 1
+                self._affinity_offset += 1
                 logger.debug(
                     "proxy pool cursor advanced: proxy={} kind={} cursor={}",
                     lease.proxy_url,
@@ -224,7 +232,11 @@ class ProxyDirectory:
     # Internal
     # ------------------------------------------------------------------
 
-    async def _pick_proxy_url(self, resource: bool = False) -> str | None:
+    async def _pick_proxy_url(
+        self,
+        resource: bool = False,
+        affinity_key: str | None = None,
+    ) -> str | None:
         if self._egress_mode == EgressMode.DIRECT:
             return None
         async with self._lock:
@@ -238,9 +250,17 @@ class ProxyDirectory:
                 return None
             if self._egress_mode == EgressMode.SINGLE_PROXY:
                 return nodes[0].proxy_url
-            # PROXY_POOL: distribute sequential requests across all egresses.
-            idx = self._pool_cursor % len(nodes)
-            self._pool_cursor += 1
+            if affinity_key:
+                digest = hashlib.blake2s(
+                    affinity_key.encode("utf-8"),
+                    digest_size=8,
+                ).digest()
+                idx = (
+                    int.from_bytes(digest, "big") + self._affinity_offset
+                ) % len(nodes)
+            else:
+                idx = self._pool_cursor % len(nodes)
+                self._pool_cursor += 1
             return nodes[idx].proxy_url
 
     async def _get_or_build_bundle(

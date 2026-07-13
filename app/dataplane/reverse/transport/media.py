@@ -36,7 +36,11 @@ async def _post_with_proxy(
     timeout_s = cfg.get_float(timeout_key, 60.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.HTTP)
+    lease = await proxy.acquire(
+        scope=ProxyScope.APP,
+        kind=RequestKind.HTTP,
+        affinity_key=token,
+    )
 
     try:
         result = await post_json(

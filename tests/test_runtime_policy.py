@@ -169,7 +169,57 @@ class RequestPolicyTests(unittest.TestCase):
 
         self.assertEqual(retries, 20)
 
-    def test_proxy_pool_rotates_on_every_acquire(self):
+    def test_proxy_pool_keeps_the_same_account_on_the_same_proxy(self):
+        async def scenario():
+            directory = ProxyDirectory()
+            directory._egress_mode = EgressMode.PROXY_POOL
+            directory._nodes = [
+                EgressNode(node_id="a", proxy_url="http://proxy-a"),
+                EgressNode(node_id="b", proxy_url="http://proxy-b"),
+            ]
+            return [
+                await directory._pick_proxy_url(affinity_key="account-a")
+                for _ in range(4)
+            ]
+
+        selected = asyncio.run(scenario())
+        self.assertEqual(selected, [selected[0]] * 4)
+
+    def test_proxy_pool_spreads_accounts_across_available_proxies(self):
+        async def scenario():
+            directory = ProxyDirectory()
+            directory._egress_mode = EgressMode.PROXY_POOL
+            directory._nodes = [
+                EgressNode(node_id="a", proxy_url="http://proxy-a"),
+                EgressNode(node_id="b", proxy_url="http://proxy-b"),
+            ]
+            return {
+                await directory._pick_proxy_url(affinity_key=f"account-{idx}")
+                for idx in range(32)
+            }
+
+        self.assertEqual(
+            asyncio.run(scenario()),
+            {"http://proxy-a", "http://proxy-b"},
+        )
+
+    def test_unaffiliated_requests_do_not_remap_an_account(self):
+        async def scenario():
+            directory = ProxyDirectory()
+            directory._egress_mode = EgressMode.PROXY_POOL
+            directory._nodes = [
+                EgressNode(node_id="a", proxy_url="http://proxy-a"),
+                EgressNode(node_id="b", proxy_url="http://proxy-b"),
+            ]
+            before = await directory._pick_proxy_url(affinity_key="account-a")
+            await directory._pick_proxy_url()
+            after = await directory._pick_proxy_url(affinity_key="account-a")
+            return before, after
+
+        before, after = asyncio.run(scenario())
+        self.assertEqual(before, after)
+
+    def test_proxy_pool_rotates_requests_without_account_affinity(self):
         async def scenario():
             directory = ProxyDirectory()
             directory._egress_mode = EgressMode.PROXY_POOL

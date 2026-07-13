@@ -102,6 +102,7 @@ async def _grpc_call(
             scope=ProxyScope.APP,
             kind=RequestKind.HTTP,
             clearance_origin=origin,
+            affinity_key=token,
         )
 
     try:
@@ -198,6 +199,7 @@ async def set_birth_date(
             scope=ProxyScope.APP,
             kind=RequestKind.HTTP,
             clearance_origin=GROK_ORIGIN,
+            affinity_key=token,
         )
 
     payload = orjson.dumps(build_set_birth_payload())
@@ -241,6 +243,7 @@ async def nsfw_sequence(token: str) -> None:
         scope=ProxyScope.APP,
         kind=RequestKind.HTTP,
         clearance_origin=GROK_ORIGIN,
+        affinity_key=token,
     )
 
     kwargs = build_session_kwargs(lease=lease)

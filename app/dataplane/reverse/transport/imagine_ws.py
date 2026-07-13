@@ -306,7 +306,11 @@ async def stream_images(
 
         # ── Establish connection ──────────────────────────────────────────────
         proxy   = await get_proxy_runtime()
-        lease   = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.WEBSOCKET)
+        lease   = await proxy.acquire(
+            scope=ProxyScope.APP,
+            kind=RequestKind.WEBSOCKET,
+            affinity_key=token,
+        )
         headers = build_ws_headers(token=token, lease=lease)
 
         try:

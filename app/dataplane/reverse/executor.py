@@ -65,7 +65,7 @@ async def execute(
 
     # Step 3: Acquire proxy
     proxy_runtime = await get_proxy_runtime()
-    proxy_lease = await proxy_runtime.acquire()
+    proxy_lease = await proxy_runtime.acquire(affinity_key=lease.token)
 
     leases = ReverseLeaseSet(
         account_idx=lease.idx,
