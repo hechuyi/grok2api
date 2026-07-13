@@ -133,6 +133,12 @@ class AccountHtmlReviewFixTests(unittest.TestCase):
         self.assertIn("const version = String(appVersion", script)
         self.assertIn("node.textContent = version ?", script)
         self.assertNotRegex(header, r'id="hd-version-tag"[^>]*>v\d')
+        for name in ("account.html", "config.html", "cache.html"):
+            page = Path("app/statics/admin", name).read_text(encoding="utf-8")
+            self.assertIn(
+                "admin-header.js?v={{APP_VERSION}}-runtime-meta",
+                page,
+            )
 
     def test_disabled_nsfw_buttons_use_row_specific_unavailable_reason(self):
         with open("app/statics/admin/account.html", encoding="utf-8") as fh:
