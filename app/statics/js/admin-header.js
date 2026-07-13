@@ -530,9 +530,11 @@ window.renderAdminHeader = async function renderAdminHeader() {
   };
 
   const applyVersion = () => {
-    // 版本信息入口已禁用
-    const node = mount.querySelector('#hd-version');
-    node?.remove();
+    const node = mount.querySelector('#hd-version-tag');
+    if (!node) return;
+    const version = String(appVersion || '').trim().replace(/^v/i, '');
+    node.textContent = version ? `v${version}` : '';
+    node.hidden = !version;
   };
 
   await loadVersion();

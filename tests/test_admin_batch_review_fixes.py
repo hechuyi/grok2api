@@ -125,6 +125,15 @@ class RedisRepositoryReviewFixTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AccountHtmlReviewFixTests(unittest.TestCase):
+    def test_header_version_comes_from_runtime_metadata(self):
+        script = Path("app/statics/js/admin-header.js").read_text(encoding="utf-8")
+        header = Path("app/statics/admin/header.html").read_text(encoding="utf-8")
+
+        self.assertIn("querySelector('#hd-version-tag')", script)
+        self.assertIn("const version = String(appVersion", script)
+        self.assertIn("node.textContent = version ?", script)
+        self.assertNotRegex(header, r'id="hd-version-tag"[^>]*>v\d')
+
     def test_disabled_nsfw_buttons_use_row_specific_unavailable_reason(self):
         with open("app/statics/admin/account.html", encoding="utf-8") as fh:
             html = fh.read()
