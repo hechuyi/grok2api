@@ -211,6 +211,14 @@ type accountModelQuotaBlockModel struct {
 
 func (accountModelQuotaBlockModel) TableName() string { return "account_model_quota_blocks" }
 
+type modelRuntimeStateModel struct {
+	ID        uint8     `gorm:"primaryKey;autoIncrement:false;check:chk_model_runtime_state_id,id = 1"`
+	Revision  int64     `gorm:"not null;check:chk_model_runtime_state_revision,revision >= 1"`
+	UpdatedAt time.Time `gorm:"not null"`
+}
+
+func (modelRuntimeStateModel) TableName() string { return "model_runtime_state" }
+
 type clientKeyModel struct {
 	ID                    uint64 `gorm:"primaryKey;autoIncrement"`
 	Name                  string `gorm:"size:160;not null;check:chk_client_keys_name,length(trim(name)) BETWEEN 1 AND 160"`
@@ -365,7 +373,7 @@ type mediaJobModel struct {
 	ModelRouteID    uint64  `gorm:"not null;check:chk_media_jobs_model_route_id,model_route_id > 0"`
 	UpstreamModel   string  `gorm:"size:255;not null;check:chk_media_jobs_upstream_model,length(trim(upstream_model)) BETWEEN 1 AND 255"`
 	Prompt          string  `gorm:"type:text;not null;check:chk_media_jobs_prompt,length(prompt) BETWEEN 0 AND 100000"`
-	Seconds         int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 1 AND 15"`
+	Seconds         int     `gorm:"not null;check:chk_media_jobs_seconds,seconds BETWEEN 1 AND 20"`
 	Size            string  `gorm:"size:32;not null;check:chk_media_jobs_size,length(trim(size)) BETWEEN 1 AND 32"`
 	Quality         string  `gorm:"size:32;not null;check:chk_media_jobs_quality,length(trim(quality)) BETWEEN 1 AND 32"`
 	Status          string  `gorm:"size:32;not null;check:chk_media_jobs_status,status IN ('queued','in_progress','completed','failed')"`

@@ -299,16 +299,7 @@ func fallbackScopes(scope domain.Scope) []domain.Scope {
 func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 	if affinity != "" {
 		digest := sha256.Sum256([]byte(affinity))
-		selected := nodes[int(binary.BigEndian.Uint64(digest[:8])%uint64(len(nodes)))]
-		if selected.Health >= 0.8 || len(nodes) == 1 {
-			return selected
-		}
-		for _, node := range nodes {
-			if node.Health > selected.Health {
-				selected = node
-			}
-		}
-		return selected
+		return nodes[int(binary.BigEndian.Uint64(digest[:8])%uint64(len(nodes)))]
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

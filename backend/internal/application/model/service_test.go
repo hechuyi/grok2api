@@ -20,6 +20,114 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
+func TestLegacyV2ModelsResolveAndListInRegistryOrderWithoutChangingNativeList(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "legacy-model-alias.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+		Name: "legacy-route-account", SourceKey: "legacy-route-account", EncryptedAccessToken: "encrypted",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := []struct {
+		publicID   string
+		upstream   string
+		capability modeldomain.Capability
+	}{
+		{publicID: "grok-chat-fast", upstream: "grok-chat-fast", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-chat-auto", upstream: "grok-chat-auto", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-chat-expert", upstream: "grok-chat-expert", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-chat-heavy", upstream: "grok-chat-heavy", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-imagine-image", upstream: "grok-imagine-image", capability: modeldomain.CapabilityImage},
+		{publicID: "grok-imagine-image-quality", upstream: "grok-imagine-image-quality", capability: modeldomain.CapabilityImage},
+		{publicID: "grok-imagine-image-edit", upstream: "imagine-image-edit", capability: modeldomain.CapabilityImageEdit},
+		{publicID: "grok-imagine-video", upstream: "grok-imagine-video", capability: modeldomain.CapabilityVideo},
+		{publicID: "grok-4.3-console", upstream: "grok-4.3-console", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.3-low", upstream: "grok-4.3-low", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.3-medium", upstream: "grok-4.3-medium", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.3-high", upstream: "grok-4.3-high", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-0309-reasoning-console", upstream: "grok-4.20-0309-reasoning-console", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-0309-console", upstream: "grok-4.20-0309-console", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-multi-agent-console", upstream: "grok-4.20-multi-agent-console", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-multi-agent-low", upstream: "grok-4.20-multi-agent-low", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-multi-agent-medium", upstream: "grok-4.20-multi-agent-medium", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-multi-agent-high", upstream: "grok-4.20-multi-agent-high", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-multi-agent-xhigh", upstream: "grok-4.20-multi-agent-xhigh", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-4.20-0309-non-reasoning-console", upstream: "grok-4.20-0309-non-reasoning-console", capability: modeldomain.CapabilityChat},
+		{publicID: "grok-build-console", upstream: "grok-build-console", capability: modeldomain.CapabilityChat},
+	}
+	for _, value := range canonical {
+		if _, err = modelRepo.Create(ctx, modeldomain.Route{
+			PublicID: value.publicID, Provider: account.ProviderWeb, UpstreamModel: value.upstream,
+			Capability: value.capability, Origin: modeldomain.OriginCatalog, Enabled: true,
+		}, []uint64{credential.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := NewService(modelRepo, accountRepo, nil, nil)
+	expectedIDs := []string{
+		"grok-4.20-0309-non-reasoning", "grok-4.20-0309", "grok-4.20-0309-reasoning",
+		"grok-4.20-0309-non-reasoning-super", "grok-4.20-0309-super", "grok-4.20-0309-reasoning-super",
+		"grok-4.20-0309-non-reasoning-heavy", "grok-4.20-0309-heavy", "grok-4.20-0309-reasoning-heavy",
+		"grok-4.20-multi-agent-0309", "grok-4.20-fast", "grok-4.3-fast", "grok-4.20-auto",
+		"grok-4.20-expert", "grok-4.20-heavy", "grok-4.3-beta", "grok-imagine-image-lite",
+		"grok-imagine-image", "grok-imagine-image-pro", "grok-imagine-image-edit", "grok-imagine-video",
+		"grok-4.3-console", "grok-4.3-low", "grok-4.3-medium", "grok-4.3-high",
+		"grok-4.20-0309-reasoning-console", "grok-4.20-0309-console", "grok-4.20-multi-agent-console",
+		"grok-4.20-multi-agent-low", "grok-4.20-multi-agent-medium", "grok-4.20-multi-agent-high",
+		"grok-4.20-multi-agent-xhigh", "grok-4.20-0309-non-reasoning-console", "grok-build-console",
+	}
+	if len(expectedIDs) != 34 {
+		t.Fatalf("legacy catalog size = %d", len(expectedIDs))
+	}
+	for _, publicID := range expectedIDs {
+		if _, err := service.GetLegacyV2ByPublicID(ctx, publicID); err != nil {
+			t.Fatalf("resolve %s: %v", publicID, err)
+		}
+	}
+	image, err := service.GetLegacyV2ByPublicID(ctx, "grok-imagine-image")
+	if err != nil || image.PublicID != "grok-imagine-image-quality" || image.UpstreamModel != "grok-imagine-image-quality" {
+		t.Fatalf("legacy quality image route = %#v, err = %v", image, err)
+	}
+	pro, err := service.GetLegacyV2ByPublicID(ctx, "grok-imagine-image-pro")
+	if err != nil || pro.PublicID != "grok-imagine-image-quality" {
+		t.Fatalf("legacy pro image route = %#v, err = %v", pro, err)
+	}
+
+	native, err := service.ListEnabled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(native) != 8 {
+		t.Fatalf("native list contains %d models, want 8 v3 canonical models", len(native))
+	}
+	listed, err := service.ListLegacyV2Enabled(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != len(expectedIDs) {
+		t.Fatalf("listed %d models, want exactly %d", len(listed), len(expectedIDs))
+	}
+	for index, publicID := range expectedIDs {
+		if listed[index].PublicID != publicID {
+			t.Fatalf("model[%d] = %q, want %q", index, listed[index].PublicID, publicID)
+		}
+	}
+}
+
 func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
 	for _, value := range []string{"", string(account.ProviderBuild), string(account.ProviderWeb), string(account.ProviderConsole)} {
 		if !validProviderFilter(value) {

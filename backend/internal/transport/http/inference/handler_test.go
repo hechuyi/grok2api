@@ -2,6 +2,7 @@ package inference
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,9 +13,134 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/repository"
+	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	"github.com/gin-gonic/gin"
 )
+
+type inferenceModelRepository struct {
+	repository.ModelRepository
+	route modeldomain.Route
+}
+
+func (r inferenceModelRepository) ListEnabled(context.Context) ([]modeldomain.Route, error) {
+	return []modeldomain.Route{r.route}, nil
+}
+
+func (r inferenceModelRepository) GetByPublicID(_ context.Context, publicID string) (modeldomain.Route, error) {
+	if publicID != r.route.PublicID {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	return r.route, nil
+}
+
+func TestModelsEndpointSupportsLegacyDetailAndDisplayName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	models := modelapp.NewService(inferenceModelRepository{route: modeldomain.Route{
+		ID: 1, PublicID: "grok-chat-fast", Provider: account.ProviderWeb, UpstreamModel: "grok-chat-fast",
+		Capability: modeldomain.CapabilityChat, Enabled: true, CreatedAt: time.Unix(123, 0),
+	}}, nil, nil, nil)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(middleware.ClientKey, clientkeydomain.Key{Prefix: "legacy_test"})
+		c.Next()
+	})
+	NewHandler(nil, models, 1<<20).Register(router.Group("/v1"))
+
+	detail := httptest.NewRecorder()
+	router.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/v1/models/grok-4.3-fast", nil))
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"id":"grok-4.3-fast"`) || !strings.Contains(detail.Body.String(), `"name":"Grok 4.3 Fast"`) {
+		t.Fatalf("legacy detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/v1/models/not-a-model", nil))
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), `"type":"invalid_request_error"`) {
+		t.Fatalf("missing detail status=%d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestInferenceStreamDefaultIsScopedToLegacyClient(t *testing.T) {
+	for _, test := range []struct {
+		body string
+		want bool
+	}{
+		{body: `{}`, want: true},
+		{body: `{"stream":true}`, want: true},
+		{body: `{"stream":false}`, want: false},
+	} {
+		normalized, streaming, err := applyStreamDefault([]byte(test.body), func() *bool {
+			var request struct {
+				Stream *bool `json:"stream"`
+			}
+			if err := json.Unmarshal([]byte(test.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			return request.Stream
+		}(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var normalizedPayload map[string]any
+		if err := json.Unmarshal(normalized, &normalizedPayload); err != nil {
+			t.Fatal(err)
+		}
+		if streaming != test.want || normalizedPayload["stream"] != test.want {
+			t.Fatalf("normalized %s stream=%v effective=%t, want %t", test.body, normalizedPayload["stream"], streaming, test.want)
+		}
+
+		var responses responsesRequest
+		if err := json.Unmarshal([]byte(test.body), &responses); err != nil {
+			t.Fatal(err)
+		}
+		if got := streamOrDefault(responses.Stream, true); got != test.want {
+			t.Fatalf("responses %s stream=%t, want %t", test.body, got, test.want)
+		}
+		var chat chatCompletionRequest
+		if err := json.Unmarshal([]byte(test.body), &chat); err != nil {
+			t.Fatal(err)
+		}
+		if got := streamOrDefault(chat.Stream, true); got != test.want {
+			t.Fatalf("chat %s stream=%t, want %t", test.body, got, test.want)
+		}
+		var messages messagesRequest
+		if err := json.Unmarshal([]byte(test.body), &messages); err != nil {
+			t.Fatal(err)
+		}
+		if got := streamOrDefault(messages.Stream, true); got != test.want {
+			t.Fatalf("messages %s stream=%t, want %t", test.body, got, test.want)
+		}
+	}
+	normalized, streaming, err := applyStreamDefault([]byte(`{}`), nil, false)
+	if err != nil || streaming || string(normalized) != `{}` {
+		t.Fatalf("native default changed: body=%s stream=%t err=%v", normalized, streaming, err)
+	}
+}
+
+func TestMessagesMissingMaxTokensGetsCompatibilityDefault(t *testing.T) {
+	body := []byte(`{"model":"grok-4.3-fast","messages":[{"role":"user","content":"hi"}]}`)
+	normalized, err := applyMessagesMaxTokensDefault(body, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["max_tokens"] != float64(defaultMessagesMaxTokens) {
+		t.Fatalf("max_tokens = %#v", payload["max_tokens"])
+	}
+	explicit := 256
+	unchanged, err := applyMessagesMaxTokensDefault([]byte(`{"max_tokens":256}`), &explicit)
+	if err != nil || string(unchanged) != `{"max_tokens":256}` {
+		t.Fatalf("explicit max_tokens changed to %s, err=%v", unchanged, err)
+	}
+}
 
 func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -81,8 +207,8 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 
 	unsupportedRecorder := httptest.NewRecorder()
 	router.ServeHTTP(unsupportedRecorder, httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{}`)))
-	if unsupportedRecorder.Code != http.StatusNotFound {
-		t.Fatalf("unsupported video endpoint status=%d", unsupportedRecorder.Code)
+	if unsupportedRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("legacy video wrong media type status=%d", unsupportedRecorder.Code)
 	}
 	contentRecorder := httptest.NewRecorder()
 	router.ServeHTTP(contentRecorder, httptest.NewRequest(http.MethodGet, "/v1/videos/request_1/content", nil))
@@ -223,14 +349,31 @@ func TestDirectUpstreamCredentialResponsesAreRewritten(t *testing.T) {
 func TestMessagesEndpointUsesAnthropicContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		if c.GetHeader("X-Test-Client") == "native" {
+			c.Set(middleware.ClientKey, clientkeydomain.Key{Prefix: "native"})
+		}
+		c.Next()
+	})
 	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
 
 	missingVersion := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4.5","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`))
 	missingVersion.Header.Set("Content-Type", "application/json")
+	missingVersion.Header.Set("X-Test-Client", "native")
 	missingRecorder := httptest.NewRecorder()
 	router.ServeHTTP(missingRecorder, missingVersion)
-	if missingRecorder.Code != http.StatusBadRequest || !strings.Contains(missingRecorder.Body.String(), `"type":"error"`) {
+	if missingRecorder.Code != http.StatusBadRequest || !strings.Contains(missingRecorder.Body.String(), `"type":"invalid_request_error"`) {
 		t.Fatalf("missing version status=%d body=%s", missingRecorder.Code, missingRecorder.Body.String())
+	}
+
+	missingTokens := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}`))
+	missingTokens.Header.Set("Content-Type", "application/json")
+	missingTokens.Header.Set("anthropic-version", "2023-06-01")
+	missingTokens.Header.Set("X-Test-Client", "native")
+	missingTokensRecorder := httptest.NewRecorder()
+	router.ServeHTTP(missingTokensRecorder, missingTokens)
+	if missingTokensRecorder.Code != http.StatusBadRequest || !strings.Contains(missingTokensRecorder.Body.String(), `"type":"invalid_request_error"`) {
+		t.Fatalf("missing max_tokens status=%d body=%s", missingTokensRecorder.Code, missingTokensRecorder.Body.String())
 	}
 
 	valid := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4.5","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`))
@@ -245,6 +388,7 @@ func TestMessagesEndpointUsesAnthropicContract(t *testing.T) {
 	zeroTokens := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"grok-4.5","max_tokens":0,"messages":[{"role":"user","content":"hi"}]}`))
 	zeroTokens.Header.Set("Content-Type", "application/json")
 	zeroTokens.Header.Set("anthropic-version", "2023-06-01")
+	zeroTokens.Header.Set("X-Test-Client", "native")
 	zeroRecorder := httptest.NewRecorder()
 	router.ServeHTTP(zeroRecorder, zeroTokens)
 	if zeroRecorder.Code != http.StatusBadRequest {

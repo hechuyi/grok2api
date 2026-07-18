@@ -93,6 +93,23 @@ func TestSystemEndpointsRequireAdminAuthentication(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointsExposeCanonicalAndLegacyShapes(t *testing.T) {
+	router := New(Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024})
+	for _, test := range []struct {
+		path string
+		body string
+	}{
+		{path: "/healthz", body: `"ok":true`},
+		{path: "/health", body: `"status":"ok"`},
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, test.path, nil))
+		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), test.body) {
+			t.Fatalf("%s status=%d body=%s", test.path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 func TestFrontendStaticFilesAndSPAFallback(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "assets"), 0o755); err != nil {

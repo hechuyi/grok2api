@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -29,7 +30,7 @@ import (
 
 func TestCatalogMatchesSupportedSurface(t *testing.T) {
 	values := Catalog()
-	if len(values) != 8 {
+	if len(values) != 8+len(legacyV2Catalog) {
 		t.Fatalf("catalog size = %d", len(values))
 	}
 	publicIDs := make(map[string]struct{}, len(values))
@@ -49,7 +50,12 @@ func TestCatalogMatchesSupportedSurface(t *testing.T) {
 			t.Fatalf("missing supported model: %s", required)
 		}
 	}
-	for _, removed := range []string{"grok-imagine-image-lite", "grok-imagine-image-speed", "grok-imagine-image-pro"} {
+	for _, required := range []string{"grok-4.3-fast", "grok-4.20-0309-non-reasoning-heavy", "grok-4.3-beta", "grok-imagine-image-lite", "grok-imagine-image-pro"} {
+		if _, exists := publicIDs[required]; !exists {
+			t.Fatalf("missing legacy compatibility model: %s", required)
+		}
+	}
+	for _, removed := range []string{"grok-imagine-image-speed"} {
 		if _, exists := publicIDs[removed]; exists {
 			t.Fatalf("obsolete image model remains: %s", removed)
 		}
@@ -71,6 +77,37 @@ func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 	var upstreamErr *webMediaUpstreamError
 	if !errors.As(err, &upstreamErr) || upstreamErr.status != http.StatusForbidden || !strings.Contains(upstreamErr.body, "challenge") {
 		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestLegacyRoutingProfilesPreserveV2ModesAndTierOrder(t *testing.T) {
+	adapter := &Adapter{}
+	tests := []struct {
+		model string
+		mode  string
+		order []account.WebTier
+	}{
+		{model: "grok-4.20-0309-non-reasoning-super", mode: "fast", order: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
+		{model: "grok-4.20-0309-non-reasoning-heavy", mode: "fast", order: []account.WebTier{account.WebTierHeavy}},
+		{model: "grok-4.3-fast", mode: "fast", order: []account.WebTier{account.WebTierHeavy, account.WebTierSuper, account.WebTierBasic}},
+		{model: "grok-4.20-auto", mode: "auto", order: []account.WebTier{account.WebTierHeavy, account.WebTierSuper}},
+		{model: "grok-4.3-beta", mode: "grok-420-computer-use-sa", order: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
+	}
+	for _, test := range tests {
+		if got := adapter.QuotaMode(test.model); got != test.mode {
+			t.Fatalf("quota mode for %s = %q, want %q", test.model, got, test.mode)
+		}
+		if got := adapter.TierOrder(test.model); !slices.Equal(got, test.order) {
+			t.Fatalf("tier order for %s = %v, want %v", test.model, got, test.order)
+		}
+	}
+	lite, ok := Resolve("grok-imagine-image-lite")
+	if !ok || lite.ProtocolModel != "imagine-lite" || lite.MinimumTier != account.WebTierBasic {
+		t.Fatalf("legacy lite route = %#v", lite)
+	}
+	quality, ok := Resolve("grok-imagine-image-pro")
+	if !ok || quality.ProtocolModel != "imagine" || quality.MinimumTier != account.WebTierSuper {
+		t.Fatalf("legacy quality route = %#v", quality)
 	}
 }
 
@@ -789,7 +826,7 @@ func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
 func TestOnlyChatModelsExposeRateLimitModes(t *testing.T) {
 	for _, spec := range Catalog() {
 		if spec.Capability == modeldomain.CapabilityChat {
-			if !slices.Contains([]string{"auto", "fast", "expert", "heavy"}, spec.Mode) {
+			if !slices.Contains([]string{"auto", "fast", "expert", "heavy", "grok-420-computer-use-sa", consoleQuotaMode}, spec.Mode) {
 				t.Fatalf("chat model %s has invalid quota mode %q", spec.PublicID, spec.Mode)
 			}
 			continue
@@ -834,6 +871,35 @@ func TestPreflightClassifiesAntiBotRejection(t *testing.T) {
 	source := io.NopCloser(strings.NewReader(`{"error":{"message":"Request rejected by anti-bot rules.","code":7,"details":[]}}` + "\n"))
 	if _, err := preflightUpstream(source); !errors.Is(err, errWebAntiBot) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPreflightAcceptsFlatContinuationFrameImmediately(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	type outcome struct {
+		body io.ReadCloser
+		err  error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		body, err := preflightUpstream(reader)
+		completed <- outcome{body: body, err: err}
+	}()
+	if _, err := io.WriteString(writer, `data: {"result":{"responseId":"parent_next"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-completed:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		_ = result.body.Close()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("preflight waited for EOF instead of accepting a flat continuation event")
 	}
 }
 

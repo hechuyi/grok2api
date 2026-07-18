@@ -505,7 +505,10 @@ func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
 		result, err = upsertAccountByIdentity(tx, value)
-		return err
+		if err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return account.Credential{}, false, mapError(err)
@@ -546,7 +549,7 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 			results[index] = result
 			existingByIdentity[stored.IdentityKey] = stored
 		}
-		return nil
+		return bumpModelRuntimeRevision(tx)
 	})
 	if err != nil {
 		return nil, mapError(err)
@@ -626,7 +629,10 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 		if err := tx.Save(&row).Error; err != nil {
 			return err
 		}
-		return saveAccountRelations(tx, value, row.ID)
+		if err := saveAccountRelations(tx, value, row.ID); err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
 	}); err != nil {
 		return account.Credential{}, mapError(err)
 	}
@@ -665,27 +671,51 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, ids []uint64, update
 	if len(values) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
-	return result.RowsAffected, result.Error
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&accountModel{}).Where("id IN ?", ids).Updates(values)
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		if updated == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return updated, err
 }
 
 func (r *AccountRepository) Delete(ctx context.Context, id uint64) error {
-	result := r.db.db.WithContext(ctx).Delete(&accountModel{}, id)
-	if result.Error != nil {
-		return mapError(result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
-	}
-	return nil
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Delete(&accountModel{}, id)
+		if result.Error != nil {
+			return mapError(result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return repository.ErrNotFound
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
 }
 
 func (r *AccountRepository) DeleteMany(ctx context.Context, ids []uint64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Where("id IN ?", ids).Delete(&accountModel{})
-	return result.RowsAffected, result.Error
+	var deleted int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id IN ?", ids).Delete(&accountModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		if deleted == 0 {
+			return nil
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
+	return deleted, err
 }
 
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
@@ -699,10 +729,20 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 		updates["encrypted_refresh"] = refreshToken
 	}
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current struct{ AuthStatus string }
+		if err := tx.Model(&accountModel{}).Select("auth_status").Where("id = ?", id).Take(&current).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
 			return err
 		}
-		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": ""}).Error
+		if err := tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": ""}).Error; err != nil {
+			return err
+		}
+		if current.AuthStatus != string(account.AuthStatusActive) {
+			return bumpModelRuntimeRevision(tx)
+		}
+		return nil
 	}); err != nil {
 		return account.Credential{}, err
 	}
@@ -884,7 +924,12 @@ func (r *AccountRepository) SaveBilling(ctx context.Context, value account.Billi
 		return err
 	}
 	row := billingModel{AccountID: value.AccountID, PlanCode: truncate(value.PlanCode, 100), PlanName: truncate(value.PlanName, 160), MonthlyLimit: value.MonthlyLimit, Used: value.Used, OnDemandCap: value.OnDemandCap, OnDemandUsed: value.OnDemandUsed, PrepaidBalance: value.PrepaidBalance, CreditUsagePercent: value.CreditUsagePercent, IsUnifiedBillingUser: value.IsUnifiedBillingUser, OnDemandEnabled: value.OnDemandEnabled, TopUpMethod: truncate(value.TopUpMethod, 100), UsagePeriodType: truncate(value.UsagePeriodType, 100), UsagePeriodStart: truncate(value.UsagePeriodStart, 64), UsagePeriodEnd: truncate(value.UsagePeriodEnd, 64), BillingPeriodStart: truncate(value.BillingPeriodStart, 64), BillingPeriodEnd: truncate(value.BillingPeriodEnd, 64), HistoryJSON: string(history), SyncedAt: value.SyncedAt}
-	return r.db.db.WithContext(ctx).Save(&row).Error
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		return bumpModelRuntimeRevision(tx)
+	})
 }
 
 func (r *AccountRepository) GetBilling(ctx context.Context, accountID uint64) (account.Billing, error) {

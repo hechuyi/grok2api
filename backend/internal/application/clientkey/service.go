@@ -258,7 +258,7 @@ func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) 
 
 // Authenticate 校验 API Key、RPM 和并发限制，并返回请求结束时必须调用的 release。
 func (s *Service) Authenticate(ctx context.Context, raw string) (clientkeydomain.Key, func(), error) {
-	prefix, ok := security.SplitClientKey(raw)
+	prefix, ok := security.ClientKeyLookupPrefix(raw)
 	if !ok {
 		return clientkeydomain.Key{}, nil, ErrInvalidKey
 	}

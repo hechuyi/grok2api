@@ -107,6 +107,7 @@ type parsedChat struct {
 	Tools           []any
 	ToolChoice      any
 	ParallelTools   bool
+	parentPriority  uint8
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -231,6 +232,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			return nil, consumeErr
 		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+		if previous != nil && currentParsed.ConversationID == "" {
+			currentParsed.ConversationID = previous.ConversationID
+		}
 		parsed = currentParsed
 		break
 	}
@@ -280,8 +284,16 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 					if errorValue, ok := root["error"].(map[string]any); ok {
 						return nil, webResponseError(errorValue)
 					}
-					if result, ok := root["result"].(map[string]any); ok && (result["conversation"] != nil || result["response"] != nil) {
-						return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
+					if result, ok := root["result"].(map[string]any); ok {
+						if response := chatEventResponse(result); response != nil {
+							if errorValue, ok := response["error"].(map[string]any); ok {
+								return nil, webResponseError(errorValue)
+							}
+							return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
+						}
+						if result["conversation"] != nil {
+							return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
+						}
 					}
 				}
 			}
@@ -332,7 +344,7 @@ func (a *Adapter) openChat(ctx context.Context, credential account.Credential, p
 	}
 	payload := buildWebChatPayload(input.Prompt, mode, attachments)
 	if previous != nil {
-		payload["responseId"] = previous.UpstreamParentResponseID
+		payload["parentResponseId"] = previous.UpstreamParentResponseID
 	}
 	data, _ := json.Marshal(payload)
 	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.ChatTimeoutSeconds)*time.Second)
@@ -813,7 +825,7 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 		parsed.ConversationID, _ = conversation["conversationId"].(string)
 		return "", "", nil
 	}
-	response, _ := result["response"].(map[string]any)
+	response := chatEventResponse(result)
 	if response == nil {
 		return "", "", nil
 	}
@@ -829,7 +841,15 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 	}
 	if userResponse, _ := response["userResponse"].(map[string]any); userResponse != nil {
 		if id, _ := userResponse["responseId"].(string); id != "" {
-			parsed.ParentID = id
+			setParentID(parsed, id, 1)
+		}
+	}
+	if id, _ := response["responseId"].(string); id != "" {
+		setParentID(parsed, id, 2)
+	}
+	if modelResponse, _ := response["modelResponse"].(map[string]any); modelResponse != nil {
+		if id, _ := modelResponse["responseId"].(string); id != "" {
+			setParentID(parsed, id, 3)
 		}
 	}
 	collectSearchSources(parsed, response)
@@ -934,6 +954,30 @@ func modelResponseStreamError(modelResponse map[string]any) error {
 	return nil
 }
 
+func chatEventResponse(result map[string]any) map[string]any {
+	if response, _ := result["response"].(map[string]any); response != nil {
+		return response
+	}
+	// Initial turns wrap response events in result.response. Grok currently
+	// emits continuation events directly in result using the same schema.
+	for _, key := range []string{
+		"responseId", "token", "modelResponse", "userResponse", "isSoftStop", "error", "keepAlive", "throttle",
+		"cardAttachment", "cardAttachments", "streamingImageGenerationResponse",
+		"webSearchResults", "xSearchResults", "messageTag", "toolUsageCard", "toolUsageCardId", "messageStepId", "rolloutId",
+	} {
+		if _, exists := result[key]; exists {
+			return result
+		}
+	}
+	return nil
+}
+
+func setParentID(parsed *parsedChat, id string, priority uint8) {
+	if id != "" && priority >= parsed.parentPriority {
+		parsed.ParentID = id
+		parsed.parentPriority = priority
+	}
+}
 func webResponseError(value map[string]any) error {
 	message, _ := value["message"].(string)
 	if message == "" {

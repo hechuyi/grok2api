@@ -29,6 +29,7 @@ const (
 	maxReadTimeout        = time.Hour
 	maxRoutingTTL         = 30 * 24 * time.Hour
 	maxRoutingCooldown    = 24 * time.Hour
+	maxRoutingAttempts    = 20
 	minAuditFlushInterval = 10 * time.Millisecond
 	maxAuditFlushInterval = time.Minute
 	maxAuditBufferSize    = 262144

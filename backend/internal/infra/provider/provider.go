@@ -251,6 +251,8 @@ type VideoRequest struct {
 	AspectRatio   string
 	Resolution    string
 	ReferenceURLs []string
+	Preset        string
+	Legacy        bool
 	Progress      func(int)
 }
 

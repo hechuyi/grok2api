@@ -65,6 +65,11 @@ func TestPublicImageSupportsGetHeadAndETag(t *testing.T) {
 	if notModified.Code != http.StatusNotModified || notModified.Body.Len() != 0 {
 		t.Fatalf("conditional GET status=%d size=%d", notModified.Code, notModified.Body.Len())
 	}
+	legacy := httptest.NewRecorder()
+	router.ServeHTTP(legacy, httptest.NewRequest(http.MethodGet, "/v1/files/image?id="+asset.ID, nil))
+	if legacy.Code != http.StatusOK || legacy.Header().Get("Content-Type") != "image/png" || legacy.Body.Len() != len(raw) {
+		t.Fatalf("legacy GET status=%d headers=%#v size=%d", legacy.Code, legacy.Header(), legacy.Body.Len())
+	}
 }
 
 func TestPublicVideoAssetSupportsGetHeadAndRange(t *testing.T) {

@@ -54,7 +54,7 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			Enabled int64
 		}
 		if err := tx.Model(&modelRouteModel{}).
-			Select("COUNT(*) AS total, COALESCE(SUM(CASE WHEN enabled = ? AND "+availableRoutePredicate+" THEN 1 ELSE 0 END), 0) AS enabled", true, true, "active").
+			Select("COUNT(*) AS total, COALESCE(SUM(CASE WHEN enabled = ? AND "+availableRoutePredicate+" THEN 1 ELSE 0 END), 0) AS enabled", true, true, "active", true, "active").
 			Scan(&models).Error; err != nil {
 			return err
 		}

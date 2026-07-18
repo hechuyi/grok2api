@@ -62,11 +62,13 @@ func (h *Handler) SetPublicAPIBaseURLResolver(resolve func() string) *Handler {
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/models", h.listModels)
+	router.GET("/models/:modelId", h.getModel)
 	router.POST("/responses", h.createResponse)
 	router.POST("/chat/completions", h.createChatCompletion)
 	router.POST("/messages", h.createMessage)
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
+	router.POST("/videos", h.createLegacyVideo)
 	router.POST("/videos/generations", h.generateVideo)
 	router.GET("/videos/:requestId", h.getVideo)
 	router.GET("/videos/:requestId/content", h.getVideoContent)
@@ -77,14 +79,14 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 
 type responsesRequest struct {
 	Model              string `json:"model"`
-	Stream             bool   `json:"stream"`
+	Stream             *bool  `json:"stream"`
 	PromptCacheKey     string `json:"prompt_cache_key"`
 	PreviousResponseID string `json:"previous_response_id"`
 }
 
 type chatCompletionRequest struct {
 	Model          string `json:"model"`
-	Stream         bool   `json:"stream"`
+	Stream         *bool  `json:"stream"`
 	PromptCacheKey string `json:"prompt_cache_key"`
 }
 
@@ -92,7 +94,7 @@ type messagesRequest struct {
 	Model          string          `json:"model"`
 	MaxTokens      *int            `json:"max_tokens"`
 	Messages       json.RawMessage `json:"messages"`
-	Stream         bool            `json:"stream"`
+	Stream         *bool           `json:"stream"`
 	PromptCacheKey string          `json:"prompt_cache_key"`
 }
 
@@ -152,30 +154,68 @@ type modelListItem struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+	Name    string `json:"name,omitempty"`
 }
 
 func (h *Handler) listModels(c *gin.Context) {
-	values, err := h.models.ListEnabled(c.Request.Context())
+	var values []modeldomain.Route
+	var err error
+	if legacyV2Client(c) {
+		values, err = h.models.ListLegacyV2Enabled(c.Request.Context())
+	} else {
+		values, err = h.models.ListEnabled(c.Request.Context())
+	}
 	if err != nil {
 		writeOpenAIError(c, http.StatusInternalServerError, "model_list_failed", "读取模型列表失败")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values)})
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values, legacyV2Client(c))})
 }
 
 // newModelListItems 按下游公开名称去重，隐藏仅用于内部选路的 Provider 前缀。
-func newModelListItems(values []modeldomain.Route) []modelListItem {
+func newModelListItems(values []modeldomain.Route, legacyMode ...bool) []modelListItem {
 	data := make([]modelListItem, 0, len(values))
 	seen := make(map[string]bool, len(values))
+	legacy := len(legacyMode) > 0 && legacyMode[0]
 	for _, value := range values {
 		publicID := modeldomain.ExternalPublicID(value.Provider, value.PublicID)
 		if seen[publicID] {
 			continue
 		}
 		seen[publicID] = true
-		data = append(data, modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api"})
+		item := modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api"}
+		if legacy {
+			item.OwnedBy = "xai"
+			item.Name = modelapp.DisplayName(publicID)
+		}
+		data = append(data, item)
 	}
 	return data
+}
+
+func (h *Handler) getModel(c *gin.Context) {
+	publicID := strings.TrimSpace(c.Param("modelId"))
+	var value modeldomain.Route
+	var err error
+	if legacyV2Client(c) {
+		value, err = h.models.GetLegacyV2ByPublicID(c.Request.Context(), publicID)
+	} else {
+		value, err = h.models.GetByPublicID(c.Request.Context(), publicID)
+	}
+	if err != nil {
+		writeOpenAIError(c, http.StatusNotFound, "model_not_found", fmt.Sprintf("Model %q not found", publicID))
+		return
+	}
+	c.JSON(http.StatusOK, modelObject(publicID, value, legacyV2Client(c)))
+}
+
+func modelObject(publicID string, value modeldomain.Route, legacy bool) gin.H {
+	result := gin.H{"id": publicID, "object": "model", "created": value.CreatedAt.Unix(), "owned_by": "grok2api"}
+	if legacy {
+		result["owned_by"] = "xai"
+		result["name"] = modelapp.DisplayName(publicID)
+	}
+	return result
 }
 
 func (h *Handler) createResponse(c *gin.Context) {
@@ -208,18 +248,30 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 		writeOpenAIError(c, http.StatusUnauthorized, "invalid_api_key", "客户端 API Key 无效")
 		return
 	}
+	legacy := legacyV2Key(clientKey)
+	body, streaming, err := applyStreamDefault(body, request.Stream, legacy)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Chat Completions 请求格式无效")
+		return
+	}
+	request.Model = routeModelForClient(clientKey, request.Model)
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
+	if legacy && h.models != nil {
+		if route, routeErr := h.models.GetByPublicID(c.Request.Context(), request.Model); routeErr == nil && h.dispatchLegacyMediaChat(c, body, streaming, route, clientKey, requestIDValue, request.Model) {
+			return
+		}
+	}
 	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
-		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
+		Body: body, Streaming: streaming, PromptCacheKey: request.PromptCacheKey,
 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body),
 	})
 	if err != nil {
 		writeGatewayError(c, err)
 		return
 	}
-	h.writeResult(c, result, request.Stream)
+	h.writeResult(c, result, streaming)
 }
 
 func (h *Handler) createMessage(c *gin.Context) {
@@ -228,18 +280,9 @@ func (h *Handler) createMessage(c *gin.Context) {
 		writeAnthropicError(c, http.StatusUnsupportedMediaType, "invalid_request_error", "Messages only supports application/json")
 		return
 	}
-	if strings.TrimSpace(c.GetHeader("anthropic-version")) == "" {
-		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "anthropic-version header is required")
-		return
-	}
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		writeAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds the configured limit")
-		return
-	}
-	var request messagesRequest
-	if json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Model) == "" || request.MaxTokens == nil || *request.MaxTokens <= 0 || len(bytes.TrimSpace(request.Messages)) == 0 {
-		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "model, max_tokens, and messages are required")
 		return
 	}
 	clientValue, exists := c.Get(middleware.ClientKey)
@@ -248,18 +291,41 @@ func (h *Handler) createMessage(c *gin.Context) {
 		writeAnthropicError(c, http.StatusUnauthorized, "authentication_error", "invalid API key")
 		return
 	}
+	legacy := legacyV2Key(clientKey)
+	if !legacy && strings.TrimSpace(c.GetHeader("anthropic-version")) == "" {
+		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "anthropic-version header is required")
+		return
+	}
+	var request messagesRequest
+	if json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Model) == "" || request.MaxTokens != nil && *request.MaxTokens <= 0 || !legacy && request.MaxTokens == nil || len(bytes.TrimSpace(request.Messages)) == 0 {
+		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "model, max_tokens, and messages are required")
+		return
+	}
+	if legacy {
+		body, err = applyMessagesMaxTokensDefault(body, request.MaxTokens)
+		if err != nil {
+			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Messages request is invalid")
+			return
+		}
+	}
+	body, streaming, err := applyStreamDefault(body, request.Stream, legacy)
+	if err != nil {
+		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Messages request is invalid")
+		return
+	}
+	request.Model = routeModelForClient(clientKey, request.Model)
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
 	result, err := h.gateway.CreateMessage(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
-		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
+		Body: body, Streaming: streaming, PromptCacheKey: request.PromptCacheKey,
 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body),
 	})
 	if err != nil {
 		writeGatewayAnthropicError(c, err)
 		return
 	}
-	h.writeAnthropicResult(c, result, request.Stream)
+	h.writeAnthropicResult(c, result, streaming)
 }
 
 func (h *Handler) generateImage(c *gin.Context) {
@@ -305,6 +371,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	request.Model = routeModelForClient(clientKey, request.Model)
 	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
@@ -405,6 +472,10 @@ func copyMedia(writer io.Writer, source io.Reader, limit int64) error {
 }
 
 func (h *Handler) editImage(c *gin.Context) {
+	if strings.HasPrefix(strings.ToLower(c.GetHeader("Content-Type")), "multipart/form-data") && legacyV2Client(c) {
+		h.editLegacyImage(c)
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
 	if !isJSONRequest(c) {
 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json")
@@ -489,6 +560,7 @@ func (h *Handler) editImage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	model = routeModelForClient(clientKey, model)
 	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
 		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
@@ -512,6 +584,26 @@ func requestIdentity(c *gin.Context) (clientkeydomain.Key, string, bool) {
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
 	return clientKey, requestIDValue, true
+}
+
+func legacyV2Key(key clientkeydomain.Key) bool {
+	return strings.HasPrefix(key.Prefix, "legacy_")
+}
+
+func legacyV2Client(c *gin.Context) bool {
+	value, exists := c.Get(middleware.ClientKey)
+	key, ok := value.(clientkeydomain.Key)
+	return exists && ok && legacyV2Key(key)
+}
+
+func routeModelForClient(key clientkeydomain.Key, publicID string) string {
+	if !legacyV2Key(key) {
+		return publicID
+	}
+	if routingID, ok := modelapp.LegacyV2RoutingID(publicID); ok {
+		return routingID
+	}
+	return publicID
 }
 
 func (h *Handler) generateVideo(c *gin.Context) {
@@ -609,6 +701,10 @@ func (h *Handler) getVideo(c *gin.Context) {
 	job, err := h.gateway.GetVideo(c.Request.Context(), strings.TrimSpace(c.Param("requestId")), clientKey)
 	if err != nil {
 		writeGatewayError(c, err)
+		return
+	}
+	if gateway.IsLegacyVideoJob(job) {
+		c.JSON(http.StatusOK, legacyVideoResponse(job))
 		return
 	}
 	c.JSON(http.StatusOK, videoGenerationResponse(job, h.videoContentURL(job.ID)))
@@ -778,25 +874,34 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Responses 请求缺少有效 model")
 		return
 	}
-	if compact {
-		body, err = forceJSONBoolean(body, "stream", false)
-		if err != nil {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Compact 请求格式无效")
-			return
-		}
-		request.Stream = false
-	}
 	clientValue, exists := c.Get(middleware.ClientKey)
 	clientKey, ok := clientValue.(clientkeydomain.Key)
 	if !exists || !ok {
 		writeOpenAIError(c, http.StatusUnauthorized, "invalid_api_key", "客户端 API Key 无效")
 		return
 	}
+	legacy := legacyV2Key(clientKey)
+	streaming := false
+	if compact {
+		body, err = forceJSONBoolean(body, "stream", false)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Compact 请求格式无效")
+			return
+		}
+		streaming = false
+	} else {
+		body, streaming, err = applyStreamDefault(body, request.Stream, legacy)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Responses 请求格式无效")
+			return
+		}
+	}
+	request.Model = routeModelForClient(clientKey, request.Model)
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
 	input := gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
-		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
+		Body: body, Streaming: streaming, PromptCacheKey: request.PromptCacheKey,
 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body), PreviousResponseID: request.PreviousResponseID,
 	}
 	var result *gateway.Result
@@ -809,7 +914,7 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		writeGatewayError(c, err)
 		return
 	}
-	h.writeResult(c, result, request.Stream && !compact)
+	h.writeResult(c, result, streaming && !compact)
 }
 
 func isJSONRequest(c *gin.Context) bool {
@@ -1304,5 +1409,42 @@ func forceJSONBoolean(body []byte, key string, value bool) ([]byte, error) {
 	if value {
 		payload[key] = json.RawMessage("true")
 	}
+	return json.Marshal(payload)
+}
+
+const defaultMessagesMaxTokens = 8192
+
+func streamOrDefault(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func applyStreamDefault(body []byte, value *bool, fallback bool) ([]byte, bool, error) {
+	streaming := streamOrDefault(value, fallback)
+	if value != nil {
+		return body, streaming, nil
+	}
+	if !fallback {
+		return body, false, nil
+	}
+	normalized, err := forceJSONBoolean(body, "stream", fallback)
+	return normalized, streaming, err
+}
+
+func applyMessagesMaxTokensDefault(body []byte, value *int) ([]byte, error) {
+	if value != nil {
+		return body, nil
+	}
+	return forceJSONInteger(body, "max_tokens", defaultMessagesMaxTokens)
+}
+
+func forceJSONInteger(body []byte, key string, value int) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	payload[key] = json.RawMessage(strconv.Itoa(value))
 	return json.Marshal(payload)
 }

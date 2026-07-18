@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,17 @@ type VideoInput struct {
 	AspectRatio   string
 	Resolution    string
 	ReferenceURLs []string
+	Preset        string
+	Legacy        bool
+	LegacySize    string
+}
+
+type videoJobInput struct {
+	ReferenceURLs []string `json:"image_urls"`
+	Preset        string   `json:"preset,omitempty"`
+	Protocol      string   `json:"protocol,omitempty"`
+	LegacySize    string   `json:"legacy_size,omitempty"`
+	Legacy        bool     `json:"-"`
 }
 
 func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job, error) {
@@ -76,7 +88,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		AccountID: accountID, AccountName: lease.Credential.Name,
 		Provider: string(route.Provider), Model: externalModel, ModelRouteID: route.ID, UpstreamModel: model.DisplayUpstreamModel(route.Provider, route.UpstreamModel), Prompt: input.Prompt,
 		Seconds: input.Duration, Size: input.AspectRatio, Quality: input.Resolution,
-		Status: media.StatusQueued, Progress: 0, InputJSON: encodeVideoInput(input.ReferenceURLs), CreatedAt: now, UpdatedAt: now,
+		Status: media.StatusQueued, Progress: 0, InputJSON: encodeVideoInput(input.ReferenceURLs, input.Preset, input.Legacy, input.LegacySize), CreatedAt: now, UpdatedAt: now,
 	}
 	reserved := false
 	if pricing, ok := audit.EstimateOfficialVideoCost(externalModel, input.Resolution, input.Duration); ok {
@@ -299,9 +311,10 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		return
 	}
 	lastProgress := job.Progress
+	jobInput := decodeVideoJobInput(job.InputJSON)
 	result, err := adapter.GenerateVideo(ctx, provider.VideoRequest{
 		Credential: lease.Credential, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
-		ReferenceURLs: decodeVideoInput(job.InputJSON),
+		ReferenceURLs: jobInput.ReferenceURLs, Preset: jobInput.Preset, Legacy: jobInput.Legacy,
 		Progress: func(value int) {
 			value = min(99, max(1, value))
 			if value-lastProgress < 5 {
@@ -480,7 +493,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
 		AccountID: &accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
-		MediaInputImages: int64(len(decodeVideoInput(job.InputJSON))),
+		MediaInputImages: int64(len(decodeVideoJobInput(job.InputJSON).ReferenceURLs)),
 		DurationMS:       durationMS, CreatedAt: createdAt,
 	}
 	if job.Status == media.StatusCompleted {
@@ -505,15 +518,29 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	return s.mediaJobs.MarkMediaJobUsageRecorded(markCtx, job.ID, time.Now().UTC())
 }
 
-func encodeVideoInput(referenceURLs []string) string {
-	data, _ := json.Marshal(map[string][]string{"image_urls": referenceURLs})
+func encodeVideoInput(referenceURLs []string, preset string, legacy bool, legacySize string) string {
+	input := videoJobInput{ReferenceURLs: referenceURLs, Preset: strings.TrimSpace(preset)}
+	if legacy {
+		input.Protocol = "legacy_v2"
+		input.LegacySize = strings.TrimSpace(legacySize)
+	}
+	data, _ := json.Marshal(input)
 	return string(data)
 }
 
-func decodeVideoInput(value string) []string {
-	var input map[string][]string
+func decodeVideoJobInput(value string) videoJobInput {
+	var input videoJobInput
 	_ = json.Unmarshal([]byte(value), &input)
-	return input["image_urls"]
+	input.Legacy = input.Protocol == "legacy_v2"
+	return input
+}
+
+func IsLegacyVideoJob(job media.Job) bool {
+	return decodeVideoJobInput(job.InputJSON).Legacy
+}
+
+func LegacyVideoSize(job media.Job) string {
+	return decodeVideoJobInput(job.InputJSON).LegacySize
 }
 
 func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, err error) {

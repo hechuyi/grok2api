@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -104,4 +106,22 @@ func SplitClientKey(raw string) (string, bool) {
 		return "", false
 	}
 	return parts[1], true
+}
+
+// ClientKeyLookupPrefix 返回鉴权仓储使用的稳定前缀。新格式保持原前缀；
+// v2 的无前缀 Key 使用完整 Key 的摘要定位，最终仍由完整摘要做恒定时间校验。
+func ClientKeyLookupPrefix(raw string) (string, bool) {
+	if strings.HasPrefix(raw, clientKeyScheme+"_") {
+		return SplitClientKey(raw)
+	}
+	if raw == "" || len(raw) > 1024 || !utf8.ValidString(raw) {
+		return "", false
+	}
+	for _, value := range raw {
+		if unicode.IsControl(value) {
+			return "", false
+		}
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return "legacy_" + hex.EncodeToString(sum[:8]), true
 }

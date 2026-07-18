@@ -17,3 +17,21 @@ func TestClientKeyFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestClientKeyLookupPrefixSupportsLegacyKeysWithoutWeakeningG2AValidation(t *testing.T) {
+	prefix, ok := ClientKeyLookupPrefix("legacy-key-123")
+	if !ok || prefix != "legacy_b43642573aa5d4a9" {
+		t.Fatalf("legacy prefix = %q, %v", prefix, ok)
+	}
+
+	prefix, ok = ClientKeyLookupPrefix("g2a_abc123_secret_value")
+	if !ok || prefix != "abc123" {
+		t.Fatalf("g2a prefix = %q, %v", prefix, ok)
+	}
+
+	for _, value := range []string{"", "g2a_", "g2a__secret", "legacy\nkey"} {
+		if _, ok := ClientKeyLookupPrefix(value); ok {
+			t.Fatalf("ClientKeyLookupPrefix(%q) unexpectedly succeeded", value)
+		}
+	}
+}
