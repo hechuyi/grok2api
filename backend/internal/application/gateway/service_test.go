@@ -212,6 +212,103 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 }
 
+func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "gateway-first-event.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	first, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first-event-timeout", SourceKey: "first-event-timeout",
+		EncryptedAccessToken: "one", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first-event-success", SourceKey: "first-event-success",
+		EncryptedAccessToken: "two", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-stream"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []uint64{first.ID, second.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, accountID, []string{"grok-stream"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "stream-key", Prefix: "stream-prefix",
+		SecretHash:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		EncryptedSecret: "encrypted-key", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &firstEventFailoverAdapter{failoverAdapter: failoverAdapter{firstID: first.ID}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+	service.streamFirstEventTimeout = 30 * time.Millisecond
+
+	started := time.Now()
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-first-event", ClientKey: clientKey, PublicModel: "grok-stream",
+		Body: []byte(`{"model":"grok-stream","stream":true}`), Streaming: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("first-event failover took %v", elapsed)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "resp-stream", "")
+	_ = result.Body.Close()
+	const expected = ": ready\n\ndata: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n"
+	if string(body) != expected {
+		t.Fatalf("stream body = %q", body)
+	}
+
+	adapter.mu.Lock()
+	attempts := append([]uint64(nil), adapter.attempts...)
+	idempotencyIDs := append([]string(nil), adapter.idempotencyIDs...)
+	adapter.mu.Unlock()
+	if len(attempts) != 2 || attempts[0] != first.ID || attempts[1] != second.ID {
+		t.Fatalf("attempts = %#v", attempts)
+	}
+	if len(idempotencyIDs) != 2 || idempotencyIDs[0] == "" || idempotencyIDs[1] == "" || idempotencyIDs[0] == idempotencyIDs[1] {
+		t.Fatalf("idempotency ids = %#v", idempotencyIDs)
+	}
+	firstAfter, err := accountRepo.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAfter.FailureCount != 0 || firstAfter.CooldownUntil != nil {
+		t.Fatalf("timed-out account was cooled down: %#v", firstAfter)
+	}
+}
+
 func TestGatewayTeamModelRateLimitOnlySkipsMatchingTeam(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "team-model-rate-limit.db"))
@@ -1101,6 +1198,22 @@ type failoverAdapter struct {
 	resourceStatus     int
 }
 
+type firstEventFailoverAdapter struct {
+	failoverAdapter
+	idempotencyIDs []string
+}
+
+type contextBlockingReadCloser struct {
+	ctx context.Context
+}
+
+func (b *contextBlockingReadCloser) Read([]byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (*contextBlockingReadCloser) Close() error { return nil }
+
 type statelessConsoleAdapter struct{}
 
 type teamModelRateLimitConsoleAttempt struct {
@@ -1406,6 +1519,21 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 		status, body = http.StatusTooManyRequests, "limited"
 	}
 	return &provider.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+func (a *firstEventFailoverAdapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.idempotencyIDs = append(a.idempotencyIDs, request.IdempotencyID)
+	a.mu.Unlock()
+	body := io.ReadCloser(io.NopCloser(strings.NewReader(": ready\n\ndata: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n")))
+	if request.Credential.ID == a.firstID {
+		body = &contextBlockingReadCloser{ctx: ctx}
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK",
+		Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body,
+	}, nil
 }
 
 func (a *failoverAdapter) setResourceStatus(status int) {

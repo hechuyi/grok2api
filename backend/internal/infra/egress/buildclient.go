@@ -27,7 +27,7 @@ func newBuildClient(proxyURL string) (*http.Client, error) {
 		MaxConnsPerHost:       256,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
 	if strings.TrimSpace(proxyURL) != "" {

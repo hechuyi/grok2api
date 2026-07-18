@@ -56,7 +56,7 @@ type Adapter struct {
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second}
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 128, MaxConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 15 * time.Second}
 	httpClient := &http.Client{Transport: transport}
 	// 官方 CLI 使用持久化机器身份。网关不采集机器指纹，改为每个后端
 	// 进程生成一个随机 UUID，在进程生命周期内作为统一 Agent 身份。
