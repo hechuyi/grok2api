@@ -212,9 +212,9 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 }
 
-func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
+func TestGatewayRetriesBuildStreamWhenResponseHeadersTimeOut(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "gateway-first-event.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "gateway-response-header.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
 	responseRepo := relational.NewResponseRepository(database)
 	keyRepo := relational.NewClientKeyRepository(database)
 	first, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "first-event-timeout", SourceKey: "first-event-timeout",
+		Provider: account.ProviderBuild, Name: "response-header-timeout", SourceKey: "response-header-timeout",
 		EncryptedAccessToken: "one", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
 		AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
 	})
@@ -236,7 +236,7 @@ func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "first-event-success", SourceKey: "first-event-success",
+		Provider: account.ProviderBuild, Name: "response-header-success", SourceKey: "response-header-success",
 		EncryptedAccessToken: "two", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
 		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
 	})
@@ -260,24 +260,24 @@ func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	adapter := &firstEventFailoverAdapter{failoverAdapter: failoverAdapter{firstID: first.ID}}
+	adapter := &responseHeaderFailoverAdapter{failoverAdapter: failoverAdapter{firstID: first.ID}}
 	registry := provider.NewRegistry(adapter)
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
 	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
-	service.streamFirstEventTimeout = 30 * time.Millisecond
+	service.streamResponseHeaderTimeout = 30 * time.Millisecond
 
 	started := time.Now()
 	result, err := service.CreateResponse(ctx, Input{
-		RequestID: "req-first-event", ClientKey: clientKey, PublicModel: "grok-stream",
+		RequestID: "req-response-header", ClientKey: clientKey, PublicModel: "grok-stream",
 		Body: []byte(`{"model":"grok-stream","stream":true}`), Streaming: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("first-event failover took %v", elapsed)
+		t.Fatalf("response-header failover took %v", elapsed)
 	}
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
@@ -1280,21 +1280,36 @@ type failoverAdapter struct {
 	resourceStatus     int
 }
 
-type firstEventFailoverAdapter struct {
+type responseHeaderFailoverAdapter struct {
 	failoverAdapter
 	idempotencyIDs []string
 }
 
-type contextBlockingReadCloser struct {
-	ctx context.Context
+type delayedContextReadCloser struct {
+	ctx    context.Context
+	delay  time.Duration
+	reader *strings.Reader
+	once   sync.Once
+	err    error
 }
 
-func (b *contextBlockingReadCloser) Read([]byte) (int, error) {
-	<-b.ctx.Done()
-	return 0, b.ctx.Err()
+func (r *delayedContextReadCloser) Read(buffer []byte) (int, error) {
+	r.once.Do(func() {
+		timer := time.NewTimer(r.delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-r.ctx.Done():
+			r.err = r.ctx.Err()
+		}
+	})
+	if r.err != nil {
+		return 0, r.err
+	}
+	return r.reader.Read(buffer)
 }
 
-func (*contextBlockingReadCloser) Close() error { return nil }
+func (*delayedContextReadCloser) Close() error { return nil }
 
 type statelessConsoleAdapter struct{}
 
@@ -1624,18 +1639,22 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	return &provider.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-func (a *firstEventFailoverAdapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+func (a *responseHeaderFailoverAdapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
 	a.mu.Lock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.idempotencyIDs = append(a.idempotencyIDs, request.IdempotencyID)
 	a.mu.Unlock()
-	body := io.ReadCloser(io.NopCloser(strings.NewReader(": ready\n\ndata: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n")))
 	if request.Credential.ID == a.firstID {
-		body = &contextBlockingReadCloser{ctx: ctx}
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return &provider.Response{
 		StatusCode: http.StatusOK, Status: "200 OK",
-		Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body,
+		Header: http.Header{"Content-Type": {"text/event-stream"}},
+		Body: &delayedContextReadCloser{
+			ctx: ctx, delay: 75 * time.Millisecond,
+			reader: strings.NewReader(": ready\n\ndata: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n"),
+		},
 	}, nil
 }
 

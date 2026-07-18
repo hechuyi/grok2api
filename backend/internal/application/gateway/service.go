@@ -104,28 +104,28 @@ type accountModelSyncer interface {
 
 // Service 负责模型路由、账号选择、故障切换与审计收口。
 type Service struct {
-	models                  routeResolver
-	audits                  auditRecorder
-	accounts                *accountapp.Service
-	clientKeys              *clientkeyapp.Service
-	providers               *provider.Registry
-	selector                *Selector
-	responses               repository.ResponseRepository
-	maxAttempts             atomic.Int64
-	streamFirstEventTimeout time.Duration
-	mediaJobs               repository.MediaJobRepository
-	mediaAssets             videoAssetStore
-	mediaQueue              chan string
-	mediaMu                 sync.Mutex
-	mediaQueued             map[string]struct{}
-	mediaWorker             int
-	mediaQueueFull          atomic.Uint64
-	logger                  *slog.Logger
-	rateLimitMu             sync.Mutex
-	rateLimits              map[string]teamModelRateLimit
-	rateLimitTeams          map[uint64]string
-	modelSyncMu             sync.Mutex
-	modelSyncing            map[uint64]struct{}
+	models                      routeResolver
+	audits                      auditRecorder
+	accounts                    *accountapp.Service
+	clientKeys                  *clientkeyapp.Service
+	providers                   *provider.Registry
+	selector                    *Selector
+	responses                   repository.ResponseRepository
+	maxAttempts                 atomic.Int64
+	streamResponseHeaderTimeout time.Duration
+	mediaJobs                   repository.MediaJobRepository
+	mediaAssets                 videoAssetStore
+	mediaQueue                  chan string
+	mediaMu                     sync.Mutex
+	mediaQueued                 map[string]struct{}
+	mediaWorker                 int
+	mediaQueueFull              atomic.Uint64
+	logger                      *slog.Logger
+	rateLimitMu                 sync.Mutex
+	rateLimits                  map[string]teamModelRateLimit
+	rateLimitTeams              map[uint64]string
+	modelSyncMu                 sync.Mutex
+	modelSyncing                map[uint64]struct{}
 }
 
 type teamModelRateLimit struct {
@@ -152,8 +152,8 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 	service := &Service{
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
 		selector: selector, responses: responses, logger: slog.Default(),
-		streamFirstEventTimeout: defaultStreamFirstEventTimeout,
-		rateLimits:              make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]string),
+		streamResponseHeaderTimeout: defaultStreamResponseHeaderTimeout,
+		rateLimits:                  make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]string),
 		modelSyncing: make(map[uint64]struct{}),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
@@ -466,7 +466,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if ownership != nil {
 		attempts = 1
 	}
-	firstEventRetryUsed := false
+	responseHeaderRetryUsed := false
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
 		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, textBillingReservationTTL); err != nil {
@@ -489,7 +489,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		var response *provider.Response
 		var err error
 		if route.Provider == accountdomain.ProviderBuild && input.Streaming && path == "/responses" {
-			response, err = forwardWithFirstSSEEventTimeout(ctx, s.streamFirstEventTimeout, forward)
+			response, err = forwardWithResponseHeaderTimeout(ctx, s.streamResponseHeaderTimeout, forward)
 		} else {
 			response, err = forward(ctx)
 		}
@@ -559,19 +559,19 @@ attemptLoop:
 		if err != nil {
 			lease.Release()
 			lastErr = err
-			if errors.Is(err, errStreamFirstEventTimeout) {
+			if errors.Is(err, errStreamResponseHeaderTimeout) {
 				lastFailure = &UpstreamFailure{
-					HTTPStatus: http.StatusGatewayTimeout, Code: "upstream_first_event_timeout", PublicMessage: "上游服务首个流事件响应超时",
-					AccountID: credential.ID, AccountName: credential.Name, Fingerprint: "upstream_first_event_timeout", Cause: err,
+					HTTPStatus: http.StatusGatewayTimeout, Code: "upstream_response_header_timeout", PublicMessage: "上游服务响应头超时",
+					AccountID: credential.ID, AccountName: credential.Name, Fingerprint: "upstream_response_header_timeout", Cause: err,
 				}
-				if ownership != nil || firstEventRetryUsed {
+				if ownership != nil || responseHeaderRetryUsed {
 					break
 				}
-				firstEventRetryUsed = true
+				responseHeaderRetryUsed = true
 				attempts++
 				idempotencyID = ""
 				idempotencyID, _ = security.NewOpaqueToken(18)
-				s.logger.Warn("upstream_first_event_timeout", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "model", route.UpstreamModel)
+				s.logger.Warn("upstream_response_header_timeout", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "model", route.UpstreamModel)
 				continue
 			}
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
