@@ -191,6 +191,14 @@ func (s *Service) executeImage(
 		response, err = execute(ctx, route.Provider, credential, route.UpstreamModel)
 		if err != nil {
 			s.logger.Error("image_upstream_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", credential.ID, "error", err)
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = provider.ErrUnauthorized
+				lease.Release()
+				continue
+			}
 			if !provider.IsMediaPostProcessingError(err) {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
@@ -202,15 +210,22 @@ func (s *Service) executeImage(
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
 		}
+		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
+			_, _ = readRetryableBody(response.Body)
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			failedCredential := credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = provider.ErrUnauthorized
+			response = nil
+			lease.Release()
+			continue
+		}
 		if credential.Provider == accountdomain.ProviderWeb && credential.AuthType == accountdomain.AuthTypeSSO && response.StatusCode == http.StatusForbidden {
 			body, replay, _, readErr := readResponseBody(response.Body)
 			response.Body = replay
 			if readErr == nil && isBlockedUserResponse(body) {
 				_ = response.Body.Close()
-				if markErr := s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Web SSO account rejected with blocked-user"); markErr != nil {
-					s.logger.Error("image_blocked_user_mark_reauth_failed", "event_id", eventID, "request_id", requestID, "account_id", credential.ID, "error", markErr)
-				}
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.markSSOCredentialRejected(ctx, credential, "Grok Web SSO account rejected with blocked-user")
 				failedCredential := credential
 				lastCredentialFailure = &failedCredential
 				lastCredentialError = fmt.Errorf("Grok Web SSO 账号被上游标记为 blocked-user")
@@ -246,10 +261,6 @@ func (s *Service) executeImage(
 			lastCredentialError = ErrNoAvailableAccount
 		}
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
-	}
-	if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
-		_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-		s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
 	}
 	effectiveQuotaMode := lease.QuotaMode
 	accountID := credential.ID
