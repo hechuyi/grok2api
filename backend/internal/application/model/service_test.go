@@ -16,6 +16,8 @@ import (
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
@@ -33,7 +35,7 @@ func TestLegacyV2ModelsResolveAndListInRegistryOrderWithoutChangingNativeList(t 
 
 	accountRepo := relational.NewAccountRepository(database)
 	modelRepo := relational.NewModelRepository(database)
-	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+	webCredential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
 		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
 		Name: "legacy-route-account", SourceKey: "legacy-route-account", EncryptedAccessToken: "encrypted",
 		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
@@ -41,38 +43,21 @@ func TestLegacyV2ModelsResolveAndListInRegistryOrderWithoutChangingNativeList(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	canonical := []struct {
-		publicID   string
-		upstream   string
-		capability modeldomain.Capability
-	}{
-		{publicID: "grok-chat-fast", upstream: "grok-chat-fast", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-chat-auto", upstream: "grok-chat-auto", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-chat-expert", upstream: "grok-chat-expert", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-chat-heavy", upstream: "grok-chat-heavy", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-imagine-image", upstream: "grok-imagine-image", capability: modeldomain.CapabilityImage},
-		{publicID: "grok-imagine-image-quality", upstream: "grok-imagine-image-quality", capability: modeldomain.CapabilityImage},
-		{publicID: "grok-imagine-image-edit", upstream: "imagine-image-edit", capability: modeldomain.CapabilityImageEdit},
-		{publicID: "grok-imagine-video", upstream: "grok-imagine-video", capability: modeldomain.CapabilityVideo},
-		{publicID: "grok-4.3-console", upstream: "grok-4.3-console", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.3-low", upstream: "grok-4.3-low", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.3-medium", upstream: "grok-4.3-medium", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.3-high", upstream: "grok-4.3-high", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-0309-reasoning-console", upstream: "grok-4.20-0309-reasoning-console", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-0309-console", upstream: "grok-4.20-0309-console", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-multi-agent-console", upstream: "grok-4.20-multi-agent-console", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-multi-agent-low", upstream: "grok-4.20-multi-agent-low", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-multi-agent-medium", upstream: "grok-4.20-multi-agent-medium", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-multi-agent-high", upstream: "grok-4.20-multi-agent-high", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-multi-agent-xhigh", upstream: "grok-4.20-multi-agent-xhigh", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-4.20-0309-non-reasoning-console", upstream: "grok-4.20-0309-non-reasoning-console", capability: modeldomain.CapabilityChat},
-		{publicID: "grok-build-console", upstream: "grok-build-console", capability: modeldomain.CapabilityChat},
+	consoleCredential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+		Name: "legacy-console-account", SourceKey: "legacy-console-account", EncryptedAccessToken: "encrypted",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, value := range canonical {
-		if _, err = modelRepo.Create(ctx, modeldomain.Route{
-			PublicID: value.publicID, Provider: account.ProviderWeb, UpstreamModel: value.upstream,
-			Capability: value.capability, Origin: modeldomain.OriginCatalog, Enabled: true,
-		}, []uint64{credential.ID}); err != nil {
+	for _, route := range webprovider.Routes() {
+		if _, err = modelRepo.Create(ctx, route, []uint64{webCredential.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, route := range consoleprovider.Routes() {
+		if _, err = modelRepo.Create(ctx, route, []uint64{consoleCredential.ID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -99,11 +84,11 @@ func TestLegacyV2ModelsResolveAndListInRegistryOrderWithoutChangingNativeList(t 
 		}
 	}
 	image, err := service.GetLegacyV2ByPublicID(ctx, "grok-imagine-image")
-	if err != nil || image.PublicID != "grok-imagine-image-quality" || image.UpstreamModel != "grok-imagine-image-quality" {
+	if err != nil || modeldomain.ExternalPublicID(image.Provider, image.PublicID) != "grok-imagine-image-quality" || image.UpstreamModel != "grok-imagine-image-quality" {
 		t.Fatalf("legacy quality image route = %#v, err = %v", image, err)
 	}
 	pro, err := service.GetLegacyV2ByPublicID(ctx, "grok-imagine-image-pro")
-	if err != nil || pro.PublicID != "grok-imagine-image-quality" {
+	if err != nil || modeldomain.ExternalPublicID(pro.Provider, pro.PublicID) != "grok-imagine-image-pro" || pro.UpstreamModel != "grok-imagine-image-pro" {
 		t.Fatalf("legacy pro image route = %#v, err = %v", pro, err)
 	}
 
@@ -111,8 +96,8 @@ func TestLegacyV2ModelsResolveAndListInRegistryOrderWithoutChangingNativeList(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(native) != 8 {
-		t.Fatalf("native list contains %d models, want 8 v3 canonical models", len(native))
+	if len(native) != 14 {
+		t.Fatalf("native list contains %d models, want 14 canonical Web/Console models", len(native))
 	}
 	listed, err := service.ListLegacyV2Enabled(ctx)
 	if err != nil {
@@ -297,9 +282,9 @@ func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 
 	const video15 = "grok-imagine-video-1.5"
 	buildAdapter := &buildCapabilityNormalizerAdapter{modelCapabilityAdapter: &modelCapabilityAdapter{models: map[uint64][]string{
-		superPrimary.ID:  {"grok-4.5"},
-		superFallback.ID: {"grok-4.5", video15, "grok-code-fast-1", video15},
-		freeAccount.ID:   {"grok-4.5", video15},
+		superPrimary.ID:   {"grok-4.5"},
+		superFallback.ID:  {"grok-4.5", video15, "grok-code-fast-1", video15},
+		freeAccount.ID:    {"grok-4.5", video15},
 		unknownAccount.ID: {video15, "grok-4.5"},
 	}}}
 	webAdapter := &modelCapabilityAdapter{provider: account.ProviderWeb, models: map[uint64][]string{
@@ -444,10 +429,10 @@ type buildCapabilityNormalizerAdapter struct {
 	*modelCapabilityAdapter
 }
 
-func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing) []string {
-	// 与 cli.Adapter 规则一致：Super/paid 确保 1.5；否则精确移除。不读 BuildAPIFallback。
+func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
+	// 与 cli.Adapter 规则一致：Super（paid 或 entitlement）确保 1.5；否则精确移除。不读 BuildAPIFallback。
 	const video15 = "grok-imagine-video-1.5"
-	paid := billing != nil && billing.IsPaid()
+	super := account.IsBuildSuper(credential, billing)
 	result := make([]string, 0, len(models)+1)
 	seen := make(map[string]struct{}, len(models)+1)
 	hasVideo15 := false
@@ -459,7 +444,7 @@ func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(mod
 			continue
 		}
 		if modelName == video15 {
-			if !paid {
+			if !super {
 				continue
 			}
 			hasVideo15 = true
@@ -467,7 +452,7 @@ func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(mod
 		seen[modelName] = struct{}{}
 		result = append(result, modelName)
 	}
-	if paid && !hasVideo15 {
+	if super && !hasVideo15 {
 		result = append(result, video15)
 	}
 	return result

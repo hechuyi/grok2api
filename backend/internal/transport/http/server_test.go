@@ -94,7 +94,7 @@ func TestSystemEndpointsRequireAdminAuthentication(t *testing.T) {
 }
 
 func TestHealthEndpointsExposeCanonicalAndLegacyShapes(t *testing.T) {
-	router := New(Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024})
+	router := New(testDependencies())
 	for _, test := range []struct {
 		path string
 		body string

@@ -27,6 +27,9 @@ func TestInitializeSchemaUpgradesProviderChecksForConsole(t *testing.T) {
 	if err := database.db.WithContext(ctx).AutoMigrate(schemaModels...); err != nil {
 		t.Fatal(err)
 	}
+	if err := database.db.WithContext(ctx).Create(&modelRuntimeStateModel{ID: 1, Revision: 1, UpdatedAt: time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
 	accountRepository := NewAccountRepository(database)
 	created, _, err := accountRepository.UpsertByIdentity(ctx, account.Credential{
 		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "existing-build", SourceKey: "existing-build",

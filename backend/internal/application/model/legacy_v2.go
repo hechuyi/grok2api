@@ -1,6 +1,9 @@
 package model
 
-import modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+import (
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+)
 
 // legacyV2ModelSpec keeps the v2 public contract separate from v3 provider
 // routing. CanonicalID always names an existing v3 public route.
@@ -8,6 +11,7 @@ type legacyV2ModelSpec struct {
 	PublicID    string
 	RoutingID   string
 	CanonicalID string
+	Provider    account.Provider
 	Capability  modeldomain.Capability
 	DisplayName string
 }
@@ -38,19 +42,19 @@ var legacyV2Models = []legacyV2ModelSpec{
 	{PublicID: "grok-imagine-image-pro", CanonicalID: "grok-imagine-image-quality", Capability: modeldomain.CapabilityImage, DisplayName: "Grok Imagine Image Pro"},
 	{PublicID: "grok-imagine-image-edit", CanonicalID: "grok-imagine-image-edit", Capability: modeldomain.CapabilityImageEdit, DisplayName: "Grok Imagine Image Edit"},
 	{PublicID: "grok-imagine-video", CanonicalID: "grok-imagine-video", Capability: modeldomain.CapabilityVideo, DisplayName: "Grok Imagine Video"},
-	{PublicID: "grok-4.3-console", CanonicalID: "grok-4.3-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 (Console)"},
-	{PublicID: "grok-4.3-low", CanonicalID: "grok-4.3-low", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 Low Thinking"},
-	{PublicID: "grok-4.3-medium", CanonicalID: "grok-4.3-medium", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 Medium Thinking"},
-	{PublicID: "grok-4.3-high", CanonicalID: "grok-4.3-high", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 High Thinking"},
-	{PublicID: "grok-4.20-0309-reasoning-console", CanonicalID: "grok-4.20-0309-reasoning-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 Reasoning (Console)"},
-	{PublicID: "grok-4.20-0309-console", CanonicalID: "grok-4.20-0309-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 (Console)"},
-	{PublicID: "grok-4.20-multi-agent-console", CanonicalID: "grok-4.20-multi-agent-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent (Console)"},
-	{PublicID: "grok-4.20-multi-agent-low", CanonicalID: "grok-4.20-multi-agent-low", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent Low"},
-	{PublicID: "grok-4.20-multi-agent-medium", CanonicalID: "grok-4.20-multi-agent-medium", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent Medium"},
-	{PublicID: "grok-4.20-multi-agent-high", CanonicalID: "grok-4.20-multi-agent-high", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent High"},
-	{PublicID: "grok-4.20-multi-agent-xhigh", CanonicalID: "grok-4.20-multi-agent-xhigh", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent XHigh"},
-	{PublicID: "grok-4.20-0309-non-reasoning-console", CanonicalID: "grok-4.20-0309-non-reasoning-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 Non-Reasoning (Console)"},
-	{PublicID: "grok-build-console", CanonicalID: "grok-build-console", Capability: modeldomain.CapabilityChat, DisplayName: "Grok Build 0.1 (Console)"},
+	{PublicID: "grok-4.3-console", CanonicalID: "grok-4.3", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 (Console)"},
+	{PublicID: "grok-4.3-low", CanonicalID: "grok-4.3", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 Low Thinking"},
+	{PublicID: "grok-4.3-medium", CanonicalID: "grok-4.3", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 Medium Thinking"},
+	{PublicID: "grok-4.3-high", CanonicalID: "grok-4.3", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.3 High Thinking"},
+	{PublicID: "grok-4.20-0309-reasoning-console", CanonicalID: "grok-4.20-0309-reasoning", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 Reasoning (Console)"},
+	{PublicID: "grok-4.20-0309-console", CanonicalID: "grok-4.20-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 (Console)"},
+	{PublicID: "grok-4.20-multi-agent-console", CanonicalID: "grok-4.20-multi-agent-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent (Console)"},
+	{PublicID: "grok-4.20-multi-agent-low", CanonicalID: "grok-4.20-multi-agent-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent Low"},
+	{PublicID: "grok-4.20-multi-agent-medium", CanonicalID: "grok-4.20-multi-agent-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent Medium"},
+	{PublicID: "grok-4.20-multi-agent-high", CanonicalID: "grok-4.20-multi-agent-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent High"},
+	{PublicID: "grok-4.20-multi-agent-xhigh", CanonicalID: "grok-4.20-multi-agent-0309", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 Multi-Agent XHigh"},
+	{PublicID: "grok-4.20-0309-non-reasoning-console", CanonicalID: "grok-4.20-0309-non-reasoning", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok 4.20 0309 Non-Reasoning (Console)"},
+	{PublicID: "grok-build-console", CanonicalID: "grok-build-0.1", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityChat, DisplayName: "Grok Build 0.1 (Console)"},
 }
 
 var legacyV2ModelsByPublicID = func() map[string]legacyV2ModelSpec {
@@ -78,10 +82,25 @@ func LegacyV2RoutingID(publicID string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if value.RoutingID != "" {
-		return value.RoutingID, true
+	if value.Provider == account.ProviderConsole {
+		// Console 兼容名由官方 Provider alias 解析，并保留 reasoning effort。
+		return value.PublicID, true
 	}
-	return value.PublicID, true
+	routingID := value.PublicID
+	if value.RoutingID != "" {
+		routingID = value.RoutingID
+	}
+	normalized, ok := modeldomain.NormalizePublicID(account.ProviderWeb, routingID)
+	return normalized, ok
+}
+
+func legacyV2CanonicalRoutingID(value legacyV2ModelSpec) string {
+	providerValue := value.Provider
+	if providerValue == "" {
+		providerValue = account.ProviderWeb
+	}
+	normalized, _ := modeldomain.NormalizePublicID(providerValue, value.CanonicalID)
+	return normalized
 }
 
 func IsLegacyV2OnlyModel(publicID string) bool {

@@ -15,6 +15,7 @@ var schemaModels = []any{
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},
+	&webConsoleAccountLinkModel{},
 	&webAccountProfileModel{},
 	&quotaWindowModel{},
 	&billingModel{},
@@ -95,8 +96,19 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if err := d.widenMediaJobSecondsConstraint(ctx); err != nil {
 		return fmt.Errorf("迁移视频任务时长约束: %w", err)
 	}
-	if err := db.AutoMigrate(schemaModels...); err != nil {
-		return fmt.Errorf("初始化数据库表: %w", err)
+	autoMigrate := func() error {
+		return d.db.WithContext(ctx).AutoMigrate(schemaModels...)
+	}
+	var migrateErr error
+	if d.dialect == "sqlite" {
+		// SQLite 修改 CHECK 等表级约束时会重建表。provider_accounts 等父表已被多个
+		// 子表引用，必须在固定连接上暂停外键，否则 DROP 旧父表会直接失败。
+		migrateErr = d.withSQLiteForeignKeysDisabled(ctx, autoMigrate)
+	} else {
+		migrateErr = autoMigrate()
+	}
+	if migrateErr != nil {
+		return fmt.Errorf("初始化数据库表: %w", migrateErr)
 	}
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
@@ -106,6 +118,9 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	}
 	if err := d.ensureMediaAssetConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media asset 数据库约束: %w", err)
+	}
+	if err := d.backfillWebEgressIdentities(ctx); err != nil {
+		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {

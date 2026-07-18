@@ -826,7 +826,7 @@ func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
 func TestOnlyChatModelsExposeRateLimitModes(t *testing.T) {
 	for _, spec := range Catalog() {
 		if spec.Capability == modeldomain.CapabilityChat {
-			if !slices.Contains([]string{"auto", "fast", "expert", "heavy", "grok-420-computer-use-sa", consoleQuotaMode}, spec.Mode) {
+			if !slices.Contains([]string{"auto", "fast", "expert", "heavy", "grok-420-computer-use-sa"}, spec.Mode) {
 				t.Fatalf("chat model %s has invalid quota mode %q", spec.PublicID, spec.Mode)
 			}
 			continue

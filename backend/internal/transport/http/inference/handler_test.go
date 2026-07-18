@@ -42,7 +42,7 @@ func (r inferenceModelRepository) GetByPublicID(_ context.Context, publicID stri
 func TestModelsEndpointSupportsLegacyDetailAndDisplayName(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	models := modelapp.NewService(inferenceModelRepository{route: modeldomain.Route{
-		ID: 1, PublicID: "grok-chat-fast", Provider: account.ProviderWeb, UpstreamModel: "grok-chat-fast",
+		ID: 1, PublicID: "Web/grok-chat-fast", Provider: account.ProviderWeb, UpstreamModel: "grok-chat-fast",
 		Capability: modeldomain.CapabilityChat, Enabled: true, CreatedAt: time.Unix(123, 0),
 	}}, nil, nil, nil)
 	router := gin.New()

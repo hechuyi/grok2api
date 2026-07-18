@@ -134,7 +134,8 @@ func (s *Service) ListEnabled(ctx context.Context) ([]modeldomain.Route, error) 
 	values := cloneRoutes(catalog.routes)
 	result := values[:0]
 	for _, value := range values {
-		if !IsLegacyV2OnlyModel(value.PublicID) {
+		externalID := modeldomain.ExternalPublicID(value.Provider, value.PublicID)
+		if value.Provider != account.ProviderWeb || !IsLegacyV2OnlyModel(externalID) {
 			result = append(result, value)
 		}
 	}
@@ -163,7 +164,7 @@ func (s *Service) ListLegacyV2Enabled(ctx context.Context) ([]modeldomain.Route,
 		routingID, _ := LegacyV2RoutingID(legacy.PublicID)
 		target, ok := byPublicID[routingID]
 		if !ok {
-			target, ok = byPublicID[legacy.CanonicalID]
+			target, ok = byPublicID[legacyV2CanonicalRoutingID(legacy)]
 		}
 		if !ok {
 			continue
@@ -181,14 +182,14 @@ func (s *Service) GetByPublicID(ctx context.Context, publicID string) (modeldoma
 	if err != nil {
 		return modeldomain.Route{}, err
 	}
-	if value, ok := catalog.byPublicID[publicID]; ok {
+	if value, ok := runtimeRouteByPublicID(catalog, publicID); ok {
 		return cloneRoute(value), nil
 	}
 	legacy, ok := legacyV2ModelsByPublicID[publicID]
 	if !ok {
 		return modeldomain.Route{}, repository.ErrNotFound
 	}
-	value, ok := catalog.byPublicID[legacy.CanonicalID]
+	value, ok := catalog.byPublicID[legacyV2CanonicalRoutingID(legacy)]
 	if !ok {
 		return modeldomain.Route{}, repository.ErrNotFound
 	}
@@ -208,11 +209,23 @@ func (s *Service) GetLegacyV2ByPublicID(ctx context.Context, publicID string) (m
 	if value, exists := catalog.byPublicID[routingID]; exists {
 		return cloneRoute(value), nil
 	}
-	value, exists := catalog.byPublicID[legacy.CanonicalID]
+	value, exists := catalog.byPublicID[legacyV2CanonicalRoutingID(legacy)]
 	if !exists {
 		return modeldomain.Route{}, repository.ErrNotFound
 	}
 	return cloneRoute(value), nil
+}
+
+func runtimeRouteByPublicID(catalog *runtimeCatalog, publicID string) (modeldomain.Route, bool) {
+	if value, ok := catalog.byPublicID[publicID]; ok {
+		return value, true
+	}
+	for _, candidate := range modeldomain.PublicIDCandidates(publicID) {
+		if value, ok := catalog.byPublicID[candidate]; ok {
+			return value, true
+		}
+	}
+	return modeldomain.Route{}, false
 }
 
 func (s *Service) loadRuntimeCatalog(ctx context.Context) (*runtimeCatalog, error) {
@@ -658,7 +671,7 @@ func (s *Service) syncAccountCapabilities(ctx context.Context, value account.Cre
 			s.markCapabilitySyncFailed(credential.ID, attemptedAt, billingErr)
 			return nil, billingErr
 		}
-		models = normalizeDiscoveredModels(normalizer.NormalizeAccountModelCapabilities(models, billing))
+		models = normalizeDiscoveredModels(normalizer.NormalizeAccountModelCapabilities(models, billing, credential))
 	}
 	if err := s.models.ReplaceAccountCapabilities(ctx, credential.ID, models, attemptedAt); err != nil {
 		s.markCapabilitySyncFailed(credential.ID, attemptedAt, err)

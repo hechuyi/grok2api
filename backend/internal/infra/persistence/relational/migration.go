@@ -183,7 +183,7 @@ func MigrateSQLiteToPostgres(ctx context.Context, options MigrationOptions) (Mig
 	reports := make([]MigrationTableReport, 0, len(plan))
 	err = target.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// InitializeSchema intentionally seeds this singleton. The source row is
-		// authoritative and is copied with the other 23 tables below.
+		// authoritative and is copied with the remaining tables below.
 		if err := tx.Exec("DELETE FROM model_runtime_state").Error; err != nil {
 			return fmt.Errorf("prepare model_runtime_state: %w", err)
 		}
@@ -237,18 +237,23 @@ func migrationTables() []migrationTable {
 		newMigrationTable(adminSessionModel{}, "id ASC", true),
 		newMigrationTable(accountCredentialModel{}, "account_id ASC", false),
 		newMigrationTable(accountProviderLinkModel{}, "web_account_id ASC", false),
+		newMigrationTable(webConsoleAccountLinkModel{}, "web_account_id ASC", false),
 		newMigrationTable(webAccountProfileModel{}, "account_id ASC", false),
 		newMigrationTable(quotaWindowModel{}, "account_id ASC, mode ASC", false),
 		newMigrationTable(billingModel{}, "account_id ASC", false),
 		newMigrationTable(quotaRecoveryModel{}, "account_id ASC", false),
 		newMigrationTable(accountModelCapabilityModel{}, "account_id ASC, upstream_model ASC", false),
 		newMigrationTable(accountModelSyncStateModel{}, "account_id ASC", false),
+		newMigrationTable(accountModelQuotaBlockModel{}, "account_id ASC, upstream_model ASC", false),
+		newMigrationTable(modelRouteAliasModel{}, "model_route_id ASC, alias ASC", false),
 		newMigrationTable(modelRouteAccountModel{}, "model_route_id ASC, account_id ASC", false),
 		newMigrationTable(clientKeyModelPermission{}, "client_key_id ASC, model_route_id ASC", false),
 		newMigrationTable(billingReservationModel{}, "event_id ASC", false),
+		newMigrationTable(requestAuditAttemptModel{}, "audit_id ASC, number ASC", false),
 		newMigrationTable(responseOwnershipModel{}, "response_id ASC", false),
 		newMigrationTable(webResponseStateModel{}, "response_id ASC", false),
 		newMigrationTable(mediaJobModel{}, "id ASC", false),
+		newMigrationTable(mediaUploadTicketModel{}, "token_hash ASC", false),
 	}
 }
 
