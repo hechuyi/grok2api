@@ -380,6 +380,25 @@ func (e *liteUpstreamError) Response() *provider.Response {
 	return &provider.Response{StatusCode: e.StatusCode, Status: e.Status, Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(e.Body))}
 }
 
+func isBlockedUserImageResponse(body []byte) bool {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	if code, _ := payload["code"].(string); strings.EqualFold(strings.TrimSpace(code), "blocked-user") {
+		return true
+	}
+	switch value := payload["error"].(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "blocked-user")
+	case map[string]any:
+		code, _ := value["code"].(string)
+		return strings.EqualFold(strings.TrimSpace(code), "blocked-user")
+	default:
+		return false
+	}
+}
+
 func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.Credential, spec ModelSpec, prompt string) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		upstream, lease, _, statsigTarget, err := a.openChat(ctx, credential, "", spec, normalizedChatInput{Prompt: "Drawing: " + prompt})
@@ -389,6 +408,10 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 		if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(upstream.Body, 1<<20))
 			_ = upstream.Body.Close()
+			if upstream.StatusCode == http.StatusForbidden && credential.AuthType == account.AuthTypeSSO && isBlockedUserImageResponse(body) {
+				lease.Release()
+				return "", &liteUpstreamError{StatusCode: upstream.StatusCode, Status: upstream.Status, Body: body}
+			}
 			if upstream.StatusCode == http.StatusForbidden {
 				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
 					lease.Release()

@@ -202,6 +202,23 @@ func (s *Service) executeImage(
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
 		}
+		if credential.Provider == accountdomain.ProviderWeb && credential.AuthType == accountdomain.AuthTypeSSO && response.StatusCode == http.StatusForbidden {
+			body, replay, _, readErr := readResponseBody(response.Body)
+			response.Body = replay
+			if readErr == nil && isBlockedUserResponse(body) {
+				_ = response.Body.Close()
+				if markErr := s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Web SSO account rejected with blocked-user"); markErr != nil {
+					s.logger.Error("image_blocked_user_mark_reauth_failed", "event_id", eventID, "request_id", requestID, "account_id", credential.ID, "error", markErr)
+				}
+				s.selector.MarkQuotaStateChanged(credential.Provider)
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = fmt.Errorf("Grok Web SSO 账号被上游标记为 blocked-user")
+				lease.Release()
+				response = nil
+				continue
+			}
+		}
 		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
 			_, _ = readRetryableBody(response.Body)
 			lease.Release()

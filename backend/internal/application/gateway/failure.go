@@ -149,6 +149,16 @@ func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 	return firstStringValue(root, "code", "error_code"), firstStringValue(root, "type", "error_type"), message
 }
 
+func isBlockedUserResponse(body []byte) bool {
+	code, errorType, message := extractUpstreamErrorMetadata(body)
+	for _, value := range []string{code, errorType, message} {
+		if strings.EqualFold(strings.TrimSpace(value), "blocked-user") {
+			return true
+		}
+	}
+	return false
+}
+
 func isAccountScopedForbidden(text string) bool {
 	return containsAny(text, "quota", "billing", "subscription", "entitlement", "permission", "unauthorized", "authentication", "token", "usage-exhausted", "insufficient", "spending-limit")
 }

@@ -309,6 +309,88 @@ func TestGatewayRetriesBuildStreamWhenFirstSSEEventTimesOut(t *testing.T) {
 	}
 }
 
+func TestGatewayRemovesBlockedWebSSOAccountAndRetriesImage(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "gateway-blocked-web-image.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	blocked, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "blocked-web-image", SourceKey: "blocked-web-image", EncryptedAccessToken: "blocked",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	working, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "working-web-image", SourceKey: "working-web-image", EncryptedAccessToken: "working",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: "grok-imagine-image-quality", Provider: account.ProviderWeb,
+		UpstreamModel: "grok-imagine-image-quality", Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []uint64{blocked.ID, working.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, accountID, []string{"grok-imagine-image-quality"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "blocked-image-key", Prefix: "blocked-image", SecretHash: strings.Repeat("b", 64),
+		EncryptedSecret: "encrypted-key", Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &blockedUserImageAdapter{blockedID: blocked.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
+
+	result, err := service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-blocked-web-image", ClientKey: key, PublicModel: "grok-imagine-image-quality",
+		Prompt: "test", Count: 1, Resolution: "1k", ResponseFormat: "url",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", result.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, result.Body)
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != blocked.ID || attempts[1] != working.ID {
+		t.Fatalf("attempts = %#v", attempts)
+	}
+	blockedAfter, err := accountRepo.Get(ctx, blocked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedAfter.AuthStatus != account.AuthStatusReauthRequired || blockedAfter.FailureCount != 0 || blockedAfter.CooldownUntil != nil {
+		t.Fatalf("blocked account state = %#v", blockedAfter)
+	}
+}
+
 func TestGatewayTeamModelRateLimitOnlySkipsMatchingTeam(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "team-model-rate-limit.db"))
@@ -1348,6 +1430,11 @@ type webImageStreamAdapter struct {
 	attempts      []uint64
 }
 
+type blockedUserImageAdapter struct {
+	webImageStreamAdapter
+	blockedID uint64
+}
+
 type webChatQuotaAdapter struct {
 	synced chan string
 }
@@ -1419,6 +1506,22 @@ func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provi
 	}
 	body := "event: image_generation.completed\ndata: {}\n\ndata: [DONE]\n\n"
 	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body)), QuotaUnits: 1}, nil
+}
+
+func (a *blockedUserImageAdapter) GenerateImage(_ context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.blockedID {
+		return &provider.Response{
+			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"blocked-user","message":"account blocked"}}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{"created":1,"data":[{"url":"https://example.com/image.png"}]}`)), QuotaUnits: 1,
+	}, nil
 }
 func (a *webImageStreamAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
 	return &provider.Response{
