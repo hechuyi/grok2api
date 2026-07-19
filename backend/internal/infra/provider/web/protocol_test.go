@@ -722,6 +722,68 @@ func TestExtractCapturedImageURLsHandlesNestedJSONData(t *testing.T) {
 	}
 }
 
+func TestExtractCapturedImageURLsAcceptsTrustedAbsoluteFinalAssets(t *testing.T) {
+	fixture := []byte(`{"result":{"response":{"cardAttachment":{"jsonData":"{\"image_chunk\":{\"imageUrl\":\"https://imgen.x.ai/asset/final.webp?token=opaque\",\"progress\":100,\"moderated\":false}}"}}}}` +
+		`{"result":{"response":{"cardAttachment":{"jsonData":"{\"image_chunk\":{\"imageUrl\":\"https://example.com/asset/final.webp\",\"progress\":100,\"moderated\":false}}"}}}}`)
+	want := []string{"https://imgen.x.ai/asset/final.webp?token=opaque"}
+	if got := extractCapturedImageURLs(fixture); !slices.Equal(got, want) {
+		t.Fatalf("urls = %#v, want %#v", got, want)
+	}
+}
+
+func TestRetryLiteImagePromptsUsesStrictFallbackAndClassifiesTerminalMisses(t *testing.T) {
+	prompt := `Do not create an image. Reply with "hello".`
+	encodedPrompt, _ := json.Marshal(prompt)
+	calls := 0
+	value, err := retryLiteImagePrompts(prompt, func(upstreamPrompt string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", &liteImageMissingError{HasText: true}
+		}
+		if upstreamPrompt == "Drawing: "+prompt || !strings.Contains(upstreamPrompt, string(encodedPrompt)) {
+			t.Fatalf("strict fallback prompt = %q", upstreamPrompt)
+		}
+		return "https://imgen.x.ai/final.webp", nil
+	})
+	if err != nil || value != "https://imgen.x.ai/final.webp" || calls != 2 {
+		t.Fatalf("value=%q calls=%d err=%v", value, calls, err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		missing    *liteImageMissingError
+		wantStatus int
+		wantCode   string
+		wantCalls  int
+	}{
+		{name: "policy", missing: &liteImageMissingError{Diagnostics: liteCaptureDiagnostics{ModeratedImages: 1}}, wantStatus: http.StatusUnprocessableEntity, wantCode: "content_policy_violation", wantCalls: 1},
+		{name: "text", missing: &liteImageMissingError{HasText: true}, wantStatus: http.StatusUnprocessableEntity, wantCode: "image_not_generated", wantCalls: 2},
+		{name: "empty", missing: &liteImageMissingError{}, wantStatus: http.StatusBadGateway, wantCode: "image_locator_missing", wantCalls: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			_, err := retryLiteImagePrompts("subject", func(string) (string, error) {
+				attempts++
+				return "", test.missing
+			})
+			var upstreamErr *liteUpstreamError
+			if !errors.As(err, &upstreamErr) || upstreamErr.StatusCode != test.wantStatus || attempts != test.wantCalls || !strings.Contains(string(upstreamErr.Body), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf("attempts=%d error=%#v body=%s", attempts, upstreamErr, upstreamErr.Body)
+			}
+		})
+	}
+
+	attempts := 0
+	_, err = retryLiteImagePrompts("subject", func(string) (string, error) {
+		attempts++
+		return "", &liteImageMissingError{HasText: attempts == 1}
+	})
+	var upstreamErr *liteUpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(upstreamErr.Body), `"code":"image_not_generated"`) {
+		t.Fatalf("mixed terminal misses error=%#v body=%s", upstreamErr, upstreamErr.Body)
+	}
+}
+
 func TestLiteModelResponseCardAttachmentsFallback(t *testing.T) {
 	parsed := &parsedChat{}
 	frame := map[string]any{"result": map[string]any{"response": map[string]any{
