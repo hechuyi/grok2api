@@ -39,6 +39,10 @@ var (
 	errWebUsageLimit = errors.New("Grok Web usage limit reached")
 )
 
+type webUpstreamResponseError struct{ message string }
+
+func (e *webUpstreamResponseError) Error() string { return e.message }
+
 var (
 	grokRenderPattern   = regexp.MustCompile(`(?s)<grok:render\s+card_id="([^"]+)"\s+card_type="([^"]+)"\s+type="([^"]+)"[^>]*>.*?</grok:render>`)
 	grokToolNamePattern = regexp.MustCompile(`(?is)<xai:tool_name>\s*(.*?)\s*</xai:tool_name>`)
@@ -940,7 +944,7 @@ func modelResponseStreamError(modelResponse map[string]any) error {
 		switch value := raw.(type) {
 		case string:
 			if message := strings.TrimSpace(value); message != "" {
-				return errors.New(message)
+				return webResponseError(map[string]any{"message": message})
 			}
 		case map[string]any:
 			if nested, _ := value["error"].(map[string]any); nested != nil {
@@ -988,10 +992,10 @@ func webResponseError(value map[string]any) error {
 		return fmt.Errorf("%w: %s", errWebAntiBot, message)
 	}
 	normalized := strings.ToLower(message)
-	if strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "usage quota") {
+	if strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "usage quota") || strings.Contains(normalized, "image rate limit") {
 		return fmt.Errorf("%w: %s", errWebUsageLimit, message)
 	}
-	return errors.New(message)
+	return &webUpstreamResponseError{message: message}
 }
 
 func antiBotProviderResponse() *provider.Response {

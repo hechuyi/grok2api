@@ -180,7 +180,7 @@ func (h *Handler) createLegacyImageChat(c *gin.Context, request legacyChatMediaR
 		return
 	}
 	if result.StatusCode < 200 || result.StatusCode >= 300 {
-		h.writeResult(c, result, false)
+		h.writeResult(c, result, false, streamProtocolImage)
 		return
 	}
 	content, err := readLegacyImageChatResult(result)
@@ -231,7 +231,7 @@ func (h *Handler) createLegacyImageEditChat(c *gin.Context, request legacyChatMe
 		return
 	}
 	if result.StatusCode < 200 || result.StatusCode >= 300 {
-		h.writeResult(c, result, false)
+		h.writeResult(c, result, false, streamProtocolImage)
 		return
 	}
 	content, err := readLegacyImageChatResult(result)
@@ -522,7 +522,7 @@ func (h *Handler) editLegacyImage(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
-	h.writeResult(c, result, false)
+	h.writeResult(c, result, false, streamProtocolImage)
 }
 
 func (h *Handler) createLegacyVideo(c *gin.Context) {

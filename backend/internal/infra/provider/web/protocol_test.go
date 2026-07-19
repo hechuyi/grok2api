@@ -520,6 +520,21 @@ func TestParseLiteNestedUsageLimit(t *testing.T) {
 	}
 }
 
+func TestImageRateLimitMessageClassifiedAsUsageLimit(t *testing.T) {
+	err := webResponseError(map[string]any{"message": "You've hit your image rate limit. Please try again later."})
+	if !errors.Is(err, errWebUsageLimit) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestGenericWebResponseErrorKeepsTransportHealthy(t *testing.T) {
+	err := webResponseError(map[string]any{"message": "Some content couldn't be rendered."})
+	var upstreamErr *webUpstreamResponseError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+}
+
 func TestParseLiteImageCardAttachmentVariants(t *testing.T) {
 	parsed := &parsedChat{}
 	frame := map[string]any{"result": map[string]any{"response": map[string]any{

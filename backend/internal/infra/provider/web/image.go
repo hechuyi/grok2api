@@ -380,6 +380,19 @@ func (e *liteUpstreamError) Response() *provider.Response {
 	return &provider.Response{StatusCode: e.StatusCode, Status: e.Status, Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(e.Body))}
 }
 
+func newLiteUpstreamError(statusCode int, errorType, code, message string) *liteUpstreamError {
+	body, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    errorType,
+		"code":    code,
+	}})
+	return &liteUpstreamError{
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		Body:       body,
+	}
+}
+
 func isBlockedUserImageResponse(body []byte) bool {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
@@ -435,14 +448,7 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 		if consumeErr != nil && !errors.Is(consumeErr, errLiteImageReady) {
 			if errors.Is(consumeErr, errWebUsageLimit) {
 				lease.Release()
-				response := jsonProviderResponse(http.StatusTooManyRequests, map[string]any{"error": map[string]any{
-					"message": "Grok Imagine 速率限制中，请稍后重试",
-					"type":    "rate_limit_error",
-					"code":    "usage_limit_reached",
-				}})
-				body, _ := io.ReadAll(response.Body)
-				_ = response.Body.Close()
-				return "", &liteUpstreamError{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Body: body}
+				return "", newLiteUpstreamError(http.StatusTooManyRequests, "rate_limit_error", "usage_limit_reached", "Grok Imagine 速率限制中，请稍后重试")
 			}
 			status := 0
 			if errors.Is(consumeErr, errWebAntiBot) {
@@ -451,6 +457,15 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 					lease.Release()
 					continue
 				}
+			}
+			var responseErr *webUpstreamResponseError
+			if errors.As(consumeErr, &responseErr) {
+				a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+				lease.Release()
+				if attempt == 0 {
+					continue
+				}
+				return "", newLiteUpstreamError(http.StatusBadGateway, "server_error", "image_generation_failed", responseErr.Error())
 			}
 			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, consumeErr)
 			lease.Release()
@@ -489,7 +504,7 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 				"upstream_error_code", diagnostics.ErrorCode,
 				"upstream_error", diagnostics.ErrorMessage,
 			)
-			return "", fmt.Errorf("Grok Web Lite 响应结束但未解析到最终图片")
+			return "", newLiteUpstreamError(http.StatusBadGateway, "server_error", "image_locator_missing", "Grok Web Lite 响应结束但未返回最终图片地址")
 		}
 		// Lite 上游固定生成两张，但每次查询只计一次 Fast 额度；按旧协议取首张并为 n 重复查询。
 		return parsed.Images[0], nil
